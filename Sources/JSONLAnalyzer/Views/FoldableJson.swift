@@ -147,6 +147,12 @@ struct FoldableJsonTextView: NSViewRepresentable {
 
     final class Coordinator {
         var lastSignature = ""
+        /// folds(in:) 只取决于 pretty：同一份文本不重复扫描（逐字符扫描，大记录要几十毫秒）
+        var foldsSource: String?
+        var folds: [JsonFold] = []
+        /// 最近一次算出的实际折叠集合；pretty / 折叠状态 / 搜索词都没变时直接沿用
+        var effectiveKey = ""
+        var effective: Set<Int> = []
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -179,17 +185,26 @@ struct FoldableJsonTextView: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let tv = scroll.documentView as? FoldClickTextView else { return }
+        let co = context.coordinator
 
-        // 搜索时：含匹配的折叠块自动展开，保证匹配数/跳转与可见文本一致
-        let folds = JsonFolder.folds(in: pretty)
-        let effective = Self.effectiveCollapsed(collapsed, folds: folds,
-                                                pretty: pretty, needle: highlight)
-        let sig = "\(pretty.utf8.count)|\(pretty.hashValue)|\(effective.hashValue)|\(highlight)|\(matchIndex)"
+        if co.foldsSource != pretty {
+            co.foldsSource = pretty
+            co.folds = JsonFolder.folds(in: pretty)
+        }
+        // 展示文本由「文本、折叠状态、搜索词」决定：三者都没变（例如只是切换到下一个匹配）就不重算
+        let key = "\(pretty.utf8.count)|\(pretty.hashValue)|\(collapsed.hashValue)|\(highlight)"
+        if key != co.effectiveKey {
+            co.effectiveKey = key
+            // 搜索时：含匹配的折叠块自动展开，保证匹配数/跳转与可见文本一致
+            co.effective = Self.effectiveCollapsed(collapsed, folds: co.folds,
+                                                    pretty: pretty, needle: highlight)
+        }
         tv.onToggleFold = onToggle
-        guard sig != context.coordinator.lastSignature else { return }
-        context.coordinator.lastSignature = sig
+        let sig = key + "|\(matchIndex)"
+        guard sig != co.lastSignature else { return }
+        co.lastSignature = sig
 
-        let render = JsonFoldRenderer.render(pretty, folds: folds, collapsed: effective)
+        let render = JsonFoldRenderer.render(pretty, folds: co.folds, collapsed: co.effective)
         let m = NSMutableAttributedString(attributedString: JsonHighlighter.attributed(render.text))
         let active = HighlightedTextView.applySearchHighlights(m, needle: highlight, matchIndex: matchIndex)
 
