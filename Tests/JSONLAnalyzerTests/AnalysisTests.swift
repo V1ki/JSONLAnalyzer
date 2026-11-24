@@ -641,6 +641,81 @@ final class AnalysisTests: XCTestCase {
         XCTAssertEqual(entries[6].body, "答案")
     }
 
+    // MARK: 会话还原：流式构建与截断
+
+    private func chatLines() -> [String] {
+        [
+            #"{"type":"session_meta","payload":{"cwd":"/tmp/x","model":"gpt"}}"#,
+            #"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"帮我看看"}]}}"#,
+            #"{"type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"cmd\":\"ls\"}","call_id":"c1"}}"#,
+            #"{"type":"user/message","data":{"message":{"role":"user","content":[{"type":"text","text":"你好"}]}}}"#,
+            #"{"type":"broken"#,
+            "   ",
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"答案"}]}}"#,
+            #"{"type":"user","message":{"content":[{"type":"tool_use","id":"tu1","name":"read","input":{"path":"/a"}}]}}"#,
+        ]
+    }
+
+    private func chatRow(_ n: Int, _ type: String?) -> RecordRow {
+        RecordRow(id: n, offset: 0, length: 1, type: type, subtype: nil, seq: nil,
+                  time: nil, preview: "", isInvalid: false, invalidMessage: nil)
+    }
+
+    func testBuildStreamingMatchesBatchBuild() throws {
+        let url = try writeTemp(chatLines())
+        defer { try? FileManager.default.removeItem(at: url) }
+        let file = try JsonlFile.prepare(url)
+        var pairs: [(row: RecordRow, dict: [String: Any])] = []
+        var allRows: [RecordRow] = []
+        let reader = try XCTUnwrap(file.openReader())
+        var n = 0
+        while let (line, offset) = reader.nextLine() {
+            n += 1
+            let decoded = LineParser.parseAndDecode(line: line, number: n, offset: offset)
+            allRows.append(decoded.row)
+            if let dict = decoded.root { pairs.append((decoded.row, dict)) }
+        }
+        func key(_ e: ChatEntry) -> String {
+            "\(e.id)|\(e.kind)|\(e.lineNo)|\(e.time.map { "\($0)" } ?? "-")|\(e.title ?? "-")|\(e.body)|\(e.meta ?? "-")"
+        }
+        let batch = ConversationBuilder.build(pairs)
+        let streamed = try XCTUnwrap(ConversationBuilder.buildStreaming(file, rows: allRows))
+        XCTAssertEqual(batch.count, 6)     // 坏行与空行不进对话流
+        XCTAssertEqual(streamed.count, batch.count)
+        XCTAssertEqual(streamed.map(key), batch.map(key))
+
+        // 文件已经不在了：得到空结果，而不是崩溃
+        try FileManager.default.removeItem(at: file.dataURL)
+        XCTAssertEqual(ConversationBuilder.buildStreaming(file, rows: allRows)?.count, 0)
+    }
+
+    func testBuildIdBaseContinuesNumbering() {
+        let dict: [String: Any] = ["type": "user", "message": ["content": [["type": "text", "text": "a"],
+                                                                            ["type": "text", "text": "b"]]]]
+        let first = ConversationBuilder.build([(chatRow(1, "user"), dict)])
+        XCTAssertEqual(first.map(\.id), [0, 1])
+        let next = ConversationBuilder.build([(chatRow(2, "user"), dict)], idBase: first.count)
+        XCTAssertEqual(next.map(\.id), [2, 3])
+    }
+
+    func testConversationBodyTruncationCountsCharacters() {
+        func body(_ text: String) -> String {
+            let dict: [String: Any] = ["type": "user", "message": ["content": [["type": "text", "text": text]]]]
+            return ConversationBuilder.build([(chatRow(1, "user"), dict)])[0].body
+        }
+        let limit = ConversationBuilder.bodyLimit
+        // 按字符数判断：39,999 个汉字有近 12 万字节，字节数早就超了，但不应截断
+        let cjk = body(String(repeating: "中", count: limit - 1))
+        XCTAssertEqual(cjk.count, limit - 1)
+        XCTAssertFalse(cjk.hasSuffix("（已截断）"))
+        // 超过 40,000 个字符才截断，并带提示
+        let mark = "\n…（已截断）"
+        let long = body(String(repeating: "中", count: limit + 500))
+        XCTAssertTrue(long.hasSuffix(mark))
+        XCTAssertEqual(long.count, limit + mark.count)
+        XCTAssertEqual(body("短文本"), "短文本")
+    }
+
     // MARK: LineReader
 
     func testLineReaderOffsets() throws {

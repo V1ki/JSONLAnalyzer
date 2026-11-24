@@ -33,12 +33,15 @@ struct ChatEntry: Identifiable {
 enum ConversationBuilder {
     static let bodyLimit = 40_000
 
-    static func build(_ pairs: [(row: RecordRow, dict: [String: Any])]) -> [ChatEntry] {
+    /// idBase：起始条目 id，流式构建时由调用方接着上一批编号
+    static func build(_ pairs: [(row: RecordRow, dict: [String: Any])], idBase: Int = 0) -> [ChatEntry] {
         var out: [ChatEntry] = []
         out.reserveCapacity(pairs.count / 2)
-        var nextId = 0
+        var nextId = idBase
         func emit(_ kind: ChatKind, _ row: RecordRow, title: String?, body: String, meta: String? = nil) {
-            let trimmed = body.count > bodyLimit ? String(body.prefix(bodyLimit)) + "\n…（已截断）" : body
+            // String.count 是 O(n)：先用 O(1) 的 utf8.count 排除没超限的，绝大多数条目到这一步就结束
+            let tooLong = body.utf8.count > bodyLimit && body.count > bodyLimit
+            let trimmed = tooLong ? String(body.prefix(bodyLimit)) + "\n…（已截断）" : body
             out.append(ChatEntry(id: nextId, kind: kind, lineNo: row.id,
                                  time: row.time, title: title, body: trimmed, meta: meta))
             nextId += 1
@@ -156,6 +159,27 @@ enum ConversationBuilder {
                         break
                     }
                 }
+            }
+        }
+        return out
+    }
+
+    /// 流式构建：用同一个文件句柄逐行回读、解析、建条目，解析树用完即弃——
+    /// 内存只与条目正文总量相关，不随文件大小增长（批量的 build 会把整份文件的解析树留在内存里）。
+    /// 任务被取消时返回 nil。
+    static func buildStreaming(_ file: JsonlFile, rows: [RecordRow]) -> [ChatEntry]? {
+        guard let reader = file.openRowReader() else { return [] }
+        var out: [ChatEntry] = []
+        out.reserveCapacity(rows.count / 2)
+        var processed = 0
+        for r in rows where !r.isInvalid {
+            processed += 1
+            if processed & 0xFF == 0, Task.isCancelled { return nil }
+            // JSONSerialization 的产物都是自动释放的：逐行排空，不让它们攒到任务挂起
+            autoreleasepool {
+                guard let data = reader.read(offset: r.offset, length: r.length),
+                      let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+                out.append(contentsOf: build([(r, dict)], idBase: out.count))
             }
         }
         return out

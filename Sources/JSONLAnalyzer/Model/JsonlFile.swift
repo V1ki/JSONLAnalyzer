@@ -134,8 +134,29 @@ struct JsonlFile {
 
     /// 按字节偏移回读一行（用于详情视图，不把整个文件驻留内存）。
     func readLine(offset: UInt64, length: Int) -> Data? {
-        guard let handle = try? FileHandle(forReadingFrom: dataURL) else { return nil }
-        defer { try? handle.close() }
+        guard let reader = RowReader(url: dataURL) else { return nil }
+        return reader.read(offset: offset, length: length)
+    }
+
+    /// 打开按偏移回读的读取器。要连续回读很多行时用它复用同一个文件句柄，
+    /// 不必每行都 open / close 一次（会话页逐行回读）。
+    func openRowReader() -> RowReader? {
+        RowReader(url: dataURL)
+    }
+}
+
+/// 按字节偏移随机回读的读取器，持有并复用一个文件句柄。
+/// 非线程安全：批量回读时在一个任务里串行使用。
+final class RowReader {
+    private let handle: FileHandle
+
+    init?(url: URL) {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        self.handle = handle
+    }
+    deinit { try? handle.close() }
+
+    func read(offset: UInt64, length: Int) -> Data? {
         do {
             try handle.seek(toOffset: offset)
             return try handle.read(upToCount: length)

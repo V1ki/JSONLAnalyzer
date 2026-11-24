@@ -6,7 +6,6 @@ struct ConversationTab: View {
     @EnvironmentObject private var records: RecordStore
     @State private var entries: [ChatEntry] = []
     @State private var building = false
-    @State private var buildToken = ""
 
     var body: some View {
         Group {
@@ -57,10 +56,10 @@ struct ConversationTab: View {
         .task(id: "\(fileID)-\(records.rows.count)") {
             guard case .done = records.state, !records.rows.isEmpty else {
                 entries = []
+                building = false
                 return
             }
-            buildToken = "\(fileID)-\(records.rows.count)"
-            await rebuild(fileID: fileID)
+            await rebuild()
         }
     }
 
@@ -82,29 +81,23 @@ struct ConversationTab: View {
         .padding(.horizontal, 12).padding(.vertical, 6)
     }
 
-    /// 后台把每行原始 JSON 解析后交给 ConversationBuilder
-    private func rebuild(fileID: String) async {
+    /// 后台逐行回读原始 JSON 并建条目（解析树用完即弃，内存不随文件大小增长）。
+    /// `.task(id:)` 在切换文件或行数变化时取消本任务，取消会转给后台的那份工作。
+    private func rebuild() async {
         building = true
+        let file = records.file
         let rows = records.rows
-        let raw: (RecordRow) -> [String: Any]? = { row in
-            guard let data = records.rawData(for: row) else { return nil }
-            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let work = Task.detached(priority: .userInitiated) {
+            file.map { ConversationBuilder.buildStreaming($0, rows: rows) } ?? []
         }
-        let result: [ChatEntry] = await withCheckedContinuation { cont in
-            DispatchQueue.global(qos: .userInitiated).async {
-                var pairs: [(row: RecordRow, dict: [String: Any])] = []
-                pairs.reserveCapacity(rows.count)
-                for r in rows {
-                    if let d = raw(r) { pairs.append((r, d)) }
-                }
-                cont.resume(returning: ConversationBuilder.build(pairs))
-            }
+        let result = await withTaskCancellationHandler {
+            await work.value
+        } onCancel: {
+            work.cancel()
         }
-        guard buildToken == "\(fileID)-\(records.rows.count)" else {
-            building = false
-            return
-        }
-        entries = result
+        // 被取消说明已有新一轮构建：迟到的结果不覆盖它
+        guard !Task.isCancelled else { return }
+        entries = result ?? []
         building = false
     }
 
