@@ -4,6 +4,16 @@ import SwiftUI
 
 /// JSON 语法着色（适配浅色/深色外观由系统语义色自动完成）。
 enum JsonHighlighter {
+    /// 着色规则，按顺序叠加、后者覆盖前者，所以顺序是有意的：
+    /// 键也是字符串字面量，必须排在字符串之后才不会被盖掉；
+    /// 字符串里的数字和 true/null 也不该被当成数字、关键字染色，故数字与关键字排在最前。
+    private static let patterns: [(NSRegularExpression, NSColor)] = [
+        (try! NSRegularExpression(pattern: #"-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b"#), .systemBlue),
+        (try! NSRegularExpression(pattern: #"\b(?:true|false|null)\b"#), .systemOrange),
+        (try! NSRegularExpression(pattern: #""(?:\\.|[^"\\])*""#), .systemRed),
+        (try! NSRegularExpression(pattern: #""(?:\\.|[^"\\])*"(?=\s*:)"#), .systemPurple),
+    ]
+
     static func attributed(_ json: String, fontSize: CGFloat = 12) -> NSAttributedString {
         let base = NSMutableAttributedString(string: json, attributes: [
             .font: NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular),
@@ -11,17 +21,6 @@ enum JsonHighlighter {
         ])
         guard !json.isEmpty else { return base }
 
-        let key = NSColor.systemPurple
-        let string = NSColor.systemRed
-        let number = NSColor.systemBlue
-        let boolNull = NSColor.systemOrange
-
-        let patterns: [(NSRegularExpression, NSColor)] = [
-            (try! NSRegularExpression(pattern: #""(?:\\.|[^"\\])*"(?=\s*:)"#), key),
-            (try! NSRegularExpression(pattern: #""(?:\\.|[^"\\])*""#), string),
-            (try! NSRegularExpression(pattern: #"-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b"#), number),
-            (try! NSRegularExpression(pattern: #"\b(?:true|false|null)\b"#), boolNull),
-        ]
         let full = NSRange(json.startIndex..<json.endIndex, in: json)
         for (re, color) in patterns {
             re.enumerateMatches(in: json, range: full) { m, _, _ in

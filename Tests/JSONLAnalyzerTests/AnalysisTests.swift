@@ -563,4 +563,32 @@ final class AnalysisTests: XCTestCase {
         XCTAssertEqual(store.visibleRows.count, 50)
         XCTAssertEqual(store.visibleRows.first?.type, "small-0")
     }
+
+    // MARK: 回归：JSON 高亮的键颜色被字符串色覆盖
+
+    func testJsonHighlightKeyColor() {
+        let json = """
+        {
+          "keyName" : 1,
+          "other" : "stringValue",
+          "note" : "Exit code 1 and null"
+        }
+        """
+        let attr = JsonHighlighter.attributed(json)
+        let ns = json as NSString
+        func color(at location: Int) -> NSColor? {
+            attr.attribute(.foregroundColor, at: location, effectiveRange: nil) as? NSColor
+        }
+        func color(of token: String, offsetBy offset: Int = 0) -> NSColor? {
+            color(at: ns.range(of: token).location + offset)
+        }
+        // 键是紫色，字符串值是红色
+        XCTAssertEqual(color(of: "keyName"), NSColor.systemPurple)
+        XCTAssertEqual(color(of: "other"), NSColor.systemPurple)
+        XCTAssertEqual(color(of: "stringValue"), NSColor.systemRed)
+        // 数字与关键字只在字符串之外着色
+        XCTAssertEqual(color(of: ": 1,", offsetBy: 2), NSColor.systemBlue)
+        XCTAssertEqual(color(of: "code 1", offsetBy: 5), NSColor.systemRed)
+        XCTAssertEqual(color(of: "and null", offsetBy: 4), NSColor.systemRed)
+    }
 }
