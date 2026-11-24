@@ -30,7 +30,8 @@ macOS 原生（Swift / SwiftUI）的 JSONL 文件分析工具，面向 DSH / Cod
   - 关联页：`call_id` 工具调用↔输出配对（含类型族校验）、turn 区间与压缩点、
     首行 `session_meta` 的 fork 来源（可在已扫描文件中打开父会话）
 - **记录浏览**：三栏窗口。中间是逐行列表（行号 / 类型徽标 / 时间 / 大小 / 预览），
-  支持按类型（多选）、关键字过滤，可只看损坏行；**⌘G 跳转到行**（自动清除筛选、选中并滚动到目标行）；
+  支持按类型（多选）、关键字过滤（关键字是纯数字时同时匹配行号），可只看损坏行；
+  **⌘G 跳转到行**（自动清除筛选、选中并滚动到目标行）；
   右侧格式化 + 语法高亮显示单条 JSON，
   **支持点击折叠/展开**（▾/▸ 标记在行首对齐；超过 300 行的记录打开时自动折叠到第一层；
   搜索时含匹配的折叠块自动展开），支持全部折叠/全部展开按钮与一键复制。
@@ -67,7 +68,7 @@ macOS 原生（Swift / SwiftUI）的 JSONL 文件分析工具，面向 DSH / Cod
 ```bash
 cd JSONLAnalyzer
 swift build            # 开发调试
-swift test             # 单元测试（12 个）
+swift test             # 单元测试（50 个）
 ./make-app.sh          # 生成 release 并打包 "JSONL Analyzer.app"（ad-hoc 签名，可双击）
 ```
 
@@ -83,24 +84,32 @@ swift test             # 单元测试（12 个）
 
 ## 性能说明
 
-- 侧栏只枚举文件元数据（本机 1 万+ 会话文件秒级完成）。
-- 选中文件才解析；流式逐行读取，大文件（45 MB / 6 千行 ≈ 0.9 秒，release）。
+- 侧栏只枚举文件元数据（本机 1.1 万个会话文件约 0.6 秒）。
+- 选中文件才解析；流式逐行读取。每行只做一次 JSON 解析，字段聚合、Token 扫描与
+  sequence 引用扫描合并在一次遍历里完成（`LineScanner`）。本机实测（release）：
+  Codex 58 MB ≈ 0.5 秒，Claude 108 MB ≈ 1.0 秒，DSH 138 MB ≈ 1.6 秒。
+  耗时主要取决于节点数而不是字节数——DSH 的行嵌套更深、节点更多，相对更慢。
 - 列表只保存每行的偏移与摘要，点击查看详情时再按偏移回读原文，
   100 MB 级文件内存占用为行索引级别。
+- 会话视图逐行回读、建完条目就丢掉解析树，内存只与条目正文总量有关，不随文件大小增长。
+- 文本视图的抽取结果与 Markdown 渲染结果按行缓存，搜索时不再重复读取和渲染。
 
 ## 目录结构
 
 ```
 Sources/JSONLAnalyzer/
-  App.swift                 入口：SwiftUI App、--stats/--fields CLI、菜单命令
+  App.swift                 入口：SwiftUI App、AppModel、--stats/--fields 等 CLI、菜单命令
   Model/
-    JsonlFile.swift         文件访问层：zstd 解压缓存、LineReader 流式逐行 + 偏移
-    Analysis.swift          单行解析、字段聚合、Token 扫描、时长配对（纯函数，可测试）
+    JsonlFile.swift         文件访问层：zstd 解压缓存、LineReader 流式逐行 + 偏移回读
+    Analysis.swift          LineParser 单行解析、LineScanner 单次遍历扫描（字段 / Token / sequence）、时长配对
     RecordStore.swift       单文件解析状态机（后台解析、增量发布、过滤）
-    SessionStore.swift      ~/.dsh 与 ~/.codex 会话扫描
+    SessionStore.swift      ~/.dsh、~/.codex、~/.claude 会话扫描与分组
+    Conversation.swift      把 JSONL 还原成对话流（批量与流式两种构建方式）
+    TextExtractor.swift     从一条记录里抽取适合按 Markdown 阅读的长文本字段
+    MarkdownRenderer.swift  轻量块级 Markdown 渲染器
     JsonHighlighter.swift   JSON 语法着色 + NSTextView 封装
-  Views/                    三栏窗口、侧栏、记录列表、详情（记录/概览/字段/时间线）
-Tests/JSONLAnalyzerTests/   解析与聚合的单元测试
+  Views/                    三栏窗口、侧栏、记录列表、详情（会话/记录/关联/文本/概览/字段/时间线）
+Tests/JSONLAnalyzerTests/   解析、扫描、读取器、会话还原、缓存与加载状态机的单元测试
 make-app.sh                 打包 .app
 ```
 
