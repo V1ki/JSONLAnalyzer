@@ -97,12 +97,22 @@ struct JsonlFile {
         let outHandle = try FileHandle(forWritingTo: dest)
         defer { try? outHandle.close() }
 
+        // zstd 的 stderr 写进临时文件而不是管道：下面要读完 stdout 才去看 stderr，
+        // 用管道的话 zstd 一旦写满管道缓冲（64KB）就会卡在写上，双方互相等待
+        let errURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("jsonl-analyzer-zstd-\(UUID().uuidString).log")
+        guard FileManager.default.createFile(atPath: errURL.path, contents: nil) else {
+            throw AnalysisError.decompressFailed(status: -1, detail: "无法创建临时文件：\(errURL.path)")
+        }
+        defer { try? FileManager.default.removeItem(at: errURL) }
+        let errHandle = try FileHandle(forWritingTo: errURL)
+
         let p = Process()
         p.executableURL = zstd
         p.arguments = ["-dc", src.path]
         let pipe = Pipe()
         p.standardOutput = pipe
-        p.standardError = Pipe()
+        p.standardError = errHandle
         try p.run()
 
         let reader = pipe.fileHandleForReading
@@ -112,9 +122,9 @@ struct JsonlFile {
             try outHandle.write(contentsOf: chunk)
         }
         p.waitUntilExit()
+        try? errHandle.close()
 
-        let stderrText = String(data: (p.standardError as? Pipe)?
-            .fileHandleForReading.readDataToEndOfFile() ?? Data(), encoding: .utf8) ?? ""
+        let stderrText = (try? String(contentsOf: errURL, encoding: .utf8)) ?? ""
         if p.terminationStatus != 0 {
             try? FileManager.default.removeItem(at: dest)
             throw AnalysisError.decompressFailed(status: p.terminationStatus,
