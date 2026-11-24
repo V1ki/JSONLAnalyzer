@@ -15,12 +15,6 @@ enum Fmt {
         return f
     }()
 
-    static let relative: RelativeDateTimeFormatter = {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .abbreviated
-        return f
-    }()
-
     static let bytes: ByteCountFormatter = {
         let f = ByteCountFormatter()
         f.countStyle = .file

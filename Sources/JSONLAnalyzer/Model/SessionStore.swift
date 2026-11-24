@@ -340,10 +340,6 @@ final class SessionStore: ObservableObject {
     nonisolated private static let summaryJSON = try! NSRegularExpression(
         pattern: #""type"\s*:\s*"summary"\s*,\s*"summary"\s*:\s*"([^"\\]{0,80})""#)
 
-    nonisolated private static func headWorkspace(_ url: URL) -> String? {
-        headInfo(url).cwd
-    }
-
     nonisolated private static func headInfo(_ url: URL) -> HeadInfo {
         guard !JsonlFile.isCompressedURL(url),
               let handle = try? FileHandle(forReadingFrom: url),
