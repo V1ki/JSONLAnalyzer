@@ -1,0 +1,9 @@
+# 构建产物
+.build/
+.swiftpm/
+
+# 打包生成的 App
+*.app/
+
+# macOS
+.DS_Store
