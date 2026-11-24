@@ -906,6 +906,22 @@ final class AnalysisTests: XCTestCase {
         XCTAssertEqual(store.visibleRows.first?.type, "small-0")
     }
 
+    @MainActor
+    func testFilterMatchesLineNumber() async throws {
+        let file = try JsonlFile.prepare(writeTemp((1...30).map {
+            #"{"type":"t\#($0 % 3)","seq":\#($0)}"#
+        }))
+        defer { try? FileManager.default.removeItem(at: file.url) }
+        let store = RecordStore()
+        store.load(file)
+        await waitUntilLoaded(store)
+
+        store.filter.searchText = "17"
+        try await Task.sleep(nanoseconds: 200_000_000)
+        // 没有任何预览含 17：纯数字搜索词按行号匹配
+        XCTAssertEqual(store.visibleRows.map(\.id), [17])
+    }
+
     // MARK: 回归：JSON 高亮的键颜色被字符串色覆盖
 
     func testJsonHighlightKeyColor() {

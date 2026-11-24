@@ -291,6 +291,8 @@ final class RecordStore: ObservableObject {
         filterTask?.cancel()
         filterGeneration += 1
         let generation = filterGeneration
+        // 搜索词是纯数字时同时匹配行号
+        let lineNo = Int(f.searchText.trimmingCharacters(in: .whitespaces))
         filterTask = Task.detached(priority: .userInitiated) { [weak self] in
             var out: [RecordRow] = []
             out.reserveCapacity(src.count)
@@ -303,6 +305,10 @@ final class RecordStore: ObservableObject {
                     guard let t = r.type, f.types.contains(t) else { continue }
                 }
                 if !needle.isEmpty {
+                    if let lineNo, r.id == lineNo {
+                        out.append(r)
+                        continue
+                    }
                     let hay = (r.preview + " " + r.typeLabel).lowercased()
                     if !hay.contains(needle) { continue }
                 }
