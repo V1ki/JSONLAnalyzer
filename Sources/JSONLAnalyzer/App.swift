@@ -88,8 +88,14 @@ final class AppModel: ObservableObject {
         sessions.rescan()
     }
 
+    /// 每次打开递增。准备文件可能很慢（比如解压一个大的 zstd），期间用户又打开了别的文件：
+    /// 慢的那一份完成后据此作废，不再加载，也不拿它的错误去覆盖当前文件的状态。
+    private var openToken = 0
+
     /// 打开一个文件（侧栏选择、拖拽、打开面板共用）。
     func open(_ url: URL) {
+        openToken += 1
+        let token = openToken
         selectedFileID = url.path
         selectedRow = nil
         sessions.insertExternal(url)
@@ -97,15 +103,19 @@ final class AppModel: ObservableObject {
         Task.detached(priority: .userInitiated) { [weak self] in
             do {
                 let f = try JsonlFile.prepare(url)
+                guard await self?.isOpenCurrent(token) == true else { return }
                 await self?.records.load(f)
             } catch {
                 let msg = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
+                guard await self?.isOpenCurrent(token) == true else { return }
                 await self?.records.loadFailed(msg)
                 await self?.setOpenError(msg)
             }
         }
     }
+
+    private func isOpenCurrent(_ token: Int) -> Bool { openToken == token }
 
     /// 重新解析当前文件（zstd 缓存按 mtime 自动失效）。
     func reload() {
