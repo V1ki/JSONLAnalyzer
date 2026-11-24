@@ -232,33 +232,36 @@ enum CLIStats {
             let scanner = LineScanner()
             var number = 0
             while let (line, _) = reader.nextLine() {
-                number += 1
-                ov.totalLines = number
-                // 与 GUI 同一套解析与扫描，统计口径一致
-                let decoded = LineParser.parseAndDecode(line: line, number: number, offset: 0)
-                guard let obj = decoded.object else {
-                    ov.invalidLines += 1
-                    continue
-                }
-                ov.validLines += 1
-                if let dict = decoded.root {
-                    let t = LineParser.typeValue(from: dict)
-                    let sub = (dict["payload"] as? [String: Any])?["type"] as? String
-                    if let t {
-                        ov.typeCounts[t, default: 0] += 1
+                // 同步循环中途不挂起，自动释放的对象要按行排空，否则会攒到进程退出
+                autoreleasepool {
+                    number += 1
+                    ov.totalLines = number
+                    // 与 GUI 同一套解析与扫描，统计口径一致
+                    let decoded = LineParser.parseAndDecode(line: line, number: number, offset: 0)
+                    guard let obj = decoded.object else {
+                        ov.invalidLines += 1
+                        return
                     }
-                    if let time = LineParser.timeValue(from: dict) {
-                        if ov.firstTime == nil || time < ov.firstTime! { ov.firstTime = time }
-                        if ov.lastTime == nil || time > ov.lastTime! { ov.lastTime = time }
+                    ov.validLines += 1
+                    if let dict = decoded.root {
+                        let t = LineParser.typeValue(from: dict)
+                        let sub = (dict["payload"] as? [String: Any])?["type"] as? String
+                        if let t {
+                            ov.typeCounts[t, default: 0] += 1
+                        }
+                        if let time = LineParser.timeValue(from: dict) {
+                            if ov.firstTime == nil || time < ov.firstTime! { ov.firstTime = time }
+                            if ov.lastTime == nil || time > ov.lastTime! { ov.lastTime = time }
+                        }
+                        var found = scanner.scan(dict, fields: true,
+                                                 tokens: !TokenUsageRules.skipGenericScan(type: t, subtype: sub)).tokens
+                        if t == "token_usage_record" {
+                            found = TokenUsageRules.normalize(TokenUsageRules.exactUsage(dict: dict))
+                        }
+                        for (k, v) in found { ov.tokenTotals[k, default: 0] += v }
+                    } else {
+                        scanner.scan(root: obj, fields: true)     // 根是数组/标量：只做字段聚合
                     }
-                    var found = scanner.scan(dict, fields: true,
-                                             tokens: !TokenUsageRules.skipGenericScan(type: t, subtype: sub)).tokens
-                    if t == "token_usage_record" {
-                        found = TokenUsageRules.normalize(TokenUsageRules.exactUsage(dict: dict))
-                    }
-                    for (k, v) in found { ov.tokenTotals[k, default: 0] += v }
-                } else {
-                    scanner.scan(root: obj, fields: true)     // 根是数组/标量：只做字段聚合
                 }
             }
             print(summary(file: file, overview: ov))
