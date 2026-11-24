@@ -64,36 +64,80 @@ final class AnalysisTests: XCTestCase {
         XCTAssertNil(broken.object)
     }
 
-    // MARK: FieldAnalyzer
+    // MARK: LineScanner 字段聚合
 
-    func testFieldAggregation() {
-        var fa = FieldAnalyzer()
-        let obj = try! JSONSerialization.jsonObject(with: Data(
+    func testFieldAggregation() throws {
+        let scanner = LineScanner()
+        let obj = try JSONSerialization.jsonObject(with: Data(
             #"{"a":1,"b":{"c":"x"},"arr":[{"d":true},{"d":false}],"s":[1,2,3]}"#.utf8))
-        fa.accumulate(root: obj)
-        XCTAssertEqual(fa.validLines, 1)
+        scanner.scan(root: obj, fields: true)
+        XCTAssertEqual(scanner.validLines, 1)
 
-        let f = fa.fields["a"]
+        let f = scanner.field("a")
         XCTAssertEqual(f?.count, 1)
         XCTAssertEqual(f?.types, ["integer"])
         XCTAssertEqual(f?.example, "1")
 
-        XCTAssertEqual(fa.fields["b.c"]?.types, ["string"])
-        XCTAssertEqual(fa.fields["arr[*].d"]?.count, 2)
-        XCTAssertEqual(fa.fields["arr[*].d"]?.types, ["boolean"])
-        XCTAssertEqual(fa.fields["s[*]"]?.count, 3)
-        XCTAssertEqual(fa.fields["s"]?.types, ["array"])
+        XCTAssertEqual(scanner.field("b.c")?.types, ["string"])
+        XCTAssertEqual(scanner.field("arr[*].d")?.count, 2)
+        XCTAssertEqual(scanner.field("arr[*].d")?.types, ["boolean"])
+        XCTAssertEqual(scanner.field("s[*]")?.count, 3)
+        XCTAssertEqual(scanner.field("s")?.types, ["array"])
         // 覆盖率分母为有效行数
-        XCTAssertEqual(fa.sortedByCount.first?.path, "s[*]")
+        XCTAssertEqual(scanner.sortedByCount.first?.path, "s[*]")
     }
 
-    // MARK: TokenScanner
+    func testFieldValueTypesAndExamples() throws {
+        let scanner = LineScanner()
+        let obj = try JSONSerialization.jsonObject(with: Data(
+            #"{"i":1e3,"n":2.5,"neg":-0,"big":12345678901234567890,"b":false,"z":null,"o":{},"a":[],"s":"x"}"#.utf8))
+        scanner.scan(root: obj, fields: true)
+        XCTAssertEqual(scanner.field("i")?.typesLabel, "integer")
+        XCTAssertEqual(scanner.field("i")?.example, "1000")
+        XCTAssertEqual(scanner.field("n")?.typesLabel, "number")
+        XCTAssertEqual(scanner.field("neg")?.typesLabel, "integer")
+        XCTAssertEqual(scanner.field("b")?.typesLabel, "boolean")
+        XCTAssertEqual(scanner.field("b")?.example, "false")
+        XCTAssertEqual(scanner.field("z")?.example, "null")
+        XCTAssertEqual(scanner.field("o")?.example, "{}")
+        XCTAssertEqual(scanner.field("a")?.example, "[]")
+        // 同一路径在不同行里类型不同：类型集合累加，示例值取第一次遇到的
+        scanner.scan(root: try JSONSerialization.jsonObject(with: Data(#"{"s":7}"#.utf8)), fields: true)
+        XCTAssertEqual(scanner.field("s")?.typesLabel, "integer/string")
+        XCTAssertEqual(scanner.field("s")?.example, "x")
+        XCTAssertEqual(scanner.validLines, 2)
+    }
+
+    func testFieldDepthLimitAndArraySampling() throws {
+        // 逐层包裹：l1 → l12，键 v<n> 位于第 n 层。字段聚合到第 8 层为止
+        var deep = #"{"v":1}"#
+        for level in stride(from: 12, through: 1, by: -1) {
+            deep = "{\"l\(level)\":\(deep),\"v\(level)\":1}"
+        }
+        func path(_ level: Int) -> String { (1..<level).map { "l\($0)" }.joined(separator: ".") + ".v\(level)" }
+        // 数组：只采样前 100 个元素，其余只在标量元素的示例里提示
+        let dicts = (0..<150).map { "{\"k\":\($0)}" }.joined(separator: ",")
+        let scalars = (0..<150).map(String.init).joined(separator: ",")
+        let json = "{" + deep.dropFirst().dropLast() + ",\"arr\":[\(dicts)],\"s\":[\(scalars)]}"
+        let obj = try JSONSerialization.jsonObject(with: Data(json.utf8))
+        let scanner = LineScanner()
+        scanner.scan(root: obj, fields: true)
+
+        XCTAssertNotNil(scanner.field("v1"))
+        XCTAssertNotNil(scanner.field(path(8)))     // 第 8 层的键仍被记录
+        XCTAssertNil(scanner.field(path(9)))        // 再深不再下钻
+        XCTAssertEqual(scanner.field("arr[*].k")?.count, 100)
+        XCTAssertEqual(scanner.field("arr[*].k")?.example, "0")
+        XCTAssertEqual(scanner.field("s[*]")?.count, 100)
+        XCTAssertEqual(scanner.field("s[*]")?.example, "…另有 50 个元素未采样")
+    }
+
+    // MARK: LineScanner Token 用量
 
     func testTokenScanDedupes() {
         let obj = try! JSONSerialization.jsonObject(with: Data(
             #"{"usage":{"inputTokens":100,"outputTokens":20},"stream":[{"chunk":{"usage":{"inputTokens":100,"outputTokens":20}}}]}"#.utf8))
-        var found: [String: Double] = [:]
-        TokenScanner.scan(obj, depth: 0, found: &found)
+        let found = LineScanner().scan(root: obj, tokens: true).tokens
         // 同一记录里重复的 usage 只计一次
         XCTAssertEqual(found["输入"], 100)
         XCTAssertEqual(found["输出"], 20)
@@ -103,8 +147,7 @@ final class AnalysisTests: XCTestCase {
         // Codex token_usage_record：usage（单次）< turn_token_usage（轮累计）< thread_token_usage（线程累计）
         let obj = try! JSONSerialization.jsonObject(with: Data(
             #"{"payload":{"usage":{"input_tokens":133088,"cached_input_tokens":132864,"output_tokens":179},"turn_token_usage":{"input_tokens":133088,"output_tokens":179},"thread_token_usage":{"input_tokens":500022307,"output_tokens":1315316}}}"#.utf8))
-        var found: [String: Double] = [:]
-        TokenScanner.scan(obj, depth: 0, found: &found)
+        let found = LineScanner().scan(root: obj, tokens: true).tokens
         XCTAssertEqual(found["输入"], 133088)
         XCTAssertEqual(found["缓存读"], 132864)
         XCTAssertEqual(found["输出"], 179)
@@ -113,8 +156,7 @@ final class AnalysisTests: XCTestCase {
     func testTokenSnakeCase() {
         let obj = try! JSONSerialization.jsonObject(with: Data(
             #"{"info":{"input_tokens":7,"output_tokens":3,"cached_input_tokens":5}}"#.utf8))
-        var found: [String: Double] = [:]
-        TokenScanner.scan(obj, depth: 0, found: &found)
+        let found = LineScanner().scan(root: obj, tokens: true).tokens
         XCTAssertEqual(found["输入"], 7)
         XCTAssertEqual(found["输出"], 3)
         XCTAssertEqual(found["缓存读"], 5)
@@ -371,13 +413,13 @@ final class AnalysisTests: XCTestCase {
         XCTAssertEqual(empty, [aaa.openLine, ccc.openLine])
     }
 
-    // MARK: SeqRefScanner
+    // MARK: LineScanner sequence 引用
 
     func testSeqRefScannerPatterns() throws {
         let obj = try JSONSerialization.jsonObject(with: Data(
             #"{"seq":123,"data":{"throughSeq":119,"messageSeqs":[120,121],"sourceEventSeqs":[100]}}"#.utf8))
             as! [String: Any]
-        let refs = SeqRefScanner.scan(obj)
+        let refs = LineScanner().scan(obj, seqs: true).refs
         // 根级 seq 是自身序号，不算引用
         XCTAssertFalse(refs.contains { $0.path == "seq" })
         XCTAssertEqual(refs.first { $0.path == "data.throughSeq" }?.seqs, [119])
@@ -389,24 +431,110 @@ final class AnalysisTests: XCTestCase {
         // seq_from/seq_to 同层配对展开为范围；跨度超限不展开
         let small = try JSONSerialization.jsonObject(with: Data(
             #"{"data":{"seq_from":10,"seq_to":13}}"#.utf8)) as! [String: Any]
-        let smallRefs = SeqRefScanner.scan(small)
+        let smallRefs = LineScanner().scan(small, seqs: true).refs
         XCTAssertEqual(smallRefs.count, 1)
         XCTAssertEqual(smallRefs[0].seqs, [10, 11, 12, 13])
 
         let big = try JSONSerialization.jsonObject(with: Data(
             #"{"data":{"event_seq_from":1,"event_seq_to":5000}}"#.utf8)) as! [String: Any]
-        XCTAssertTrue(SeqRefScanner.scan(big).isEmpty, "跨度超过 1000 不展开")
+        XCTAssertTrue(LineScanner().scan(big, seqs: true).refs.isEmpty, "跨度超过 1000 不展开")
     }
 
     func testSeqRefScannerNestedAndBooleanGuard() throws {
         let obj = try JSONSerialization.jsonObject(with: Data(
             #"{"a":{"parent":{"refSeq":55,"ok":true}},"stream":[{"chunk":{"seq":77}}]}"#.utf8))
             as! [String: Any]
-        let refs = SeqRefScanner.scan(obj)
+        let refs = LineScanner().scan(obj, seqs: true).refs
         // 嵌套单值、数组元素里的 seq 都识别；布尔不当作数字
         XCTAssertEqual(refs.first { $0.path == "a.parent.refSeq" }?.seqs, [55])
         XCTAssertEqual(refs.first { $0.path.contains("chunk") }?.seqs, [77])
         XCTAssertFalse(refs.contains { $0.path.contains("ok") })
+    }
+
+    // MARK: LineScanner：合并遍历
+
+    private func json(_ text: String) throws -> [String: Any] {
+        try JSONSerialization.jsonObject(with: Data(text.utf8)) as! [String: Any]
+    }
+
+    func testSeqRefUnderSeqsKeyDependsOnValueType() throws {
+        // 键以 seqs 结尾时：值是数组 → 只收其中的数字、不下钻；值是字典 → 照常下钻找嵌套引用。
+        // 以 seq 结尾的键则一律当作引用：值不是数字就什么都不做，也不下钻
+        let obj = try json(#"{"seq":1,"data":{"dictSeqs":{"innerSeq":85,"deep":[{"nestedSeq":86}]},"arrSeqs":[{"innerSeq":87},88],"numSeqs":89,"seq":{"zSeq":4}}}"#)
+        let refs = LineScanner().scan(obj, seqs: true).refs
+        // 字典遍历顺序不定，按路径比较
+        let byPath = Dictionary(refs.map { ($0.path, $0.seqs) }, uniquingKeysWith: { a, _ in a })
+        XCTAssertEqual(byPath["data.dictSeqs.innerSeq"], [85])
+        XCTAssertEqual(byPath["data.dictSeqs.deep[*].nestedSeq"], [86])
+        XCTAssertEqual(byPath["data.arrSeqs"], [88])            // 数组元素里的字典不下钻
+        XCTAssertNil(byPath["data.numSeqs"])                     // 数字不是数组，不构成引用
+        XCTAssertNil(byPath["data.seq.zSeq"])                      // 非根层的 seq 键也不下钻
+        XCTAssertEqual(byPath.count, 3)
+    }
+
+    func testSeqRefRangePairComesFirstAndRootSeqIsSkipped() throws {
+        let obj = try json(#"{"seq":5,"data":{"bSeq":2,"x_seq_from":10,"x_seq_to":12,"nested":{"ySeq":3},"seq":4}}"#)
+        let refs = LineScanner().scan(obj, seqs: true).refs
+        XCTAssertEqual(refs.first?.path, "data.x_seq_from…to")
+        XCTAssertEqual(refs.first?.seqs, [10, 11, 12])
+        XCTAssertEqual(Set(refs.map(\.path)), ["data.x_seq_from…to", "data.bSeq", "data.nested.ySeq", "data.seq"])
+        XCTAssertEqual(refs.count, 4)
+    }
+
+    func testCombinedScanMatchesSeparateScans() throws {
+        // 一行里同时有字段、token、seq 引用：合并成一次遍历的结果必须与分开扫描一致
+        var deep = #"{"input_tokens":5}"#
+        for level in 1...13 { deep = "{\"l\(level)\":\(deep)}" }      // 超过 Token 扫描深度上限
+        let text = #"{"type":"assistant/message","seq":7,"time":1700000000000,"throughSeq":[1,2],"data":{"message":{"role":"assistant","content":[{"type":"text","text":"hi"},{"type":"tool-call","id":"c1","arguments":{"cmd":"ls"}}]},"usage":{"inputTokens":100,"outputTokens":20}},"stream":[{"chunk":{"usage":{"inputTokens":90}},"refSeq":8}],"tokens":{"input_tokens":true,"deep":\#(deep)}}"#
+        let obj = try json(text)
+
+        // 字段统计累积在扫描器实例上，所以用两个实例分别做合并扫描与单独扫描
+        let all = LineScanner()
+        let combined = all.scan(obj, fields: true, tokens: true, seqs: true)
+        let fieldsScanner = LineScanner()
+        let onlyFields = fieldsScanner.scan(obj, fields: true)
+        let onlyTokens = LineScanner().scan(obj, tokens: true).tokens
+        let onlyRefs = LineScanner().scan(obj, seqs: true).refs
+
+        XCTAssertEqual(combined.tokens, onlyTokens)
+        XCTAssertEqual(combined.refs, onlyRefs)
+        XCTAssertEqual(all.sortedByCount.map(\.path), fieldsScanner.sortedByCount.map(\.path))
+        XCTAssertEqual(all.sortedByCount.map(\.count), fieldsScanner.sortedByCount.map(\.count))
+        XCTAssertEqual(all.sortedByCount.map(\.typesLabel), fieldsScanner.sortedByCount.map(\.typesLabel))
+        XCTAssertEqual(combined.root?["type"] as? String, "assistant/message")
+        XCTAssertEqual(onlyFields.root?["seq"] as? Int, 7)       // 只开 fields 时同样带回根字典
+        // token 取最小值；嵌套过深（第 14 层）的那个不计
+        XCTAssertEqual(onlyTokens["输入"], 90)
+        XCTAssertEqual(onlyTokens["输出"], 20)
+        XCTAssertEqual(Set(onlyRefs.map(\.path)), ["stream[*].refSeq"])
+        XCTAssertEqual(all.field("data.message.content[*].type")?.typesLabel, "string")
+        XCTAssertEqual(all.field("throughSeq")?.typesLabel, "array")
+        XCTAssertEqual(all.validLines, 1)
+    }
+
+    func testTokenScanDepthLimit() throws {
+        func nested(_ depth: Int) throws -> [String: Any] {
+            var inner = #"{"input_tokens":5}"#
+            for level in 1...depth { inner = "{\"l\(level)\":\(inner)}" }
+            return try json(inner)
+        }
+        // nested(_:) 包 wrap 层后 token 键位于第 wrap + 1 层（根的子键是第 1 层）：
+        // 第 11 层仍计入，第 12 层不计
+        XCTAssertEqual(LineScanner().scan(root: try nested(10), tokens: true).tokens["输入"], 5)
+        XCTAssertNil(LineScanner().scan(root: try nested(11), tokens: true).tokens["输入"])
+    }
+
+    func testScannerStillWorksPastMemoCap() throws {
+        // 超过记忆表上限后只是不再缓存，识别结果不变
+        let scanner = LineScanner()
+        let many = (0..<5000).map { "\"k\($0)\":\($0)" }.joined(separator: ",")
+        for round in 0..<2 {
+            let obj = try json("{\"m\":{\(many)},\"usage\":{\"input_tokens\":\(round + 1)},\"refSeq\":9}")
+            let r = scanner.scan(obj, fields: true, tokens: true, seqs: true)
+            XCTAssertEqual(r.tokens["输入"], Double(round + 1))
+            XCTAssertEqual(r.refs.map(\.path), ["refSeq"])
+        }
+        XCTAssertEqual(scanner.field("m.k4999")?.example, "4999")
     }
 
     // MARK: Codex 专项处理

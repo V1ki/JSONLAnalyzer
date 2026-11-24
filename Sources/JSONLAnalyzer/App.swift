@@ -229,40 +229,42 @@ enum CLIStats {
                 exit(1)
             }
             var ov = OverviewStats()
-            var fa = FieldAnalyzer()
+            let scanner = LineScanner()
             var number = 0
             while let (line, _) = reader.nextLine() {
                 number += 1
                 ov.totalLines = number
-                if let obj = try? JSONSerialization.jsonObject(with: Data(line)) {
-                    ov.validLines += 1
-                    fa.accumulate(root: obj)
-                    if let dict = obj as? [String: Any] {
-                        let t = LineParser.typeValue(from: dict)
-                        let sub = (dict["payload"] as? [String: Any])?["type"] as? String
-                        if let t {
-                            ov.typeCounts[t, default: 0] += 1
-                        }
-                        if let time = LineParser.timeValue(from: dict) {
-                            if ov.firstTime == nil || time < ov.firstTime! { ov.firstTime = time }
-                            if ov.lastTime == nil || time > ov.lastTime! { ov.lastTime = time }
-                        }
-                        var found: [String: Double] = [:]
-                        if t == "token_usage_record" {
-                            found = TokenUsageRules.normalize(TokenUsageRules.exactUsage(dict: dict))
-                        } else if !TokenUsageRules.skipGenericScan(type: t, subtype: sub) {
-                            TokenScanner.scan(dict, depth: 0, found: &found)
-                        }
-                        for (k, v) in found { ov.tokenTotals[k, default: 0] += v }
-                    }
-                } else {
+                // 与 GUI 同一套解析与扫描，统计口径一致
+                let decoded = LineParser.parseAndDecode(line: line, number: number, offset: 0)
+                guard let obj = decoded.object else {
                     ov.invalidLines += 1
+                    continue
+                }
+                ov.validLines += 1
+                if let dict = decoded.root {
+                    let t = LineParser.typeValue(from: dict)
+                    let sub = (dict["payload"] as? [String: Any])?["type"] as? String
+                    if let t {
+                        ov.typeCounts[t, default: 0] += 1
+                    }
+                    if let time = LineParser.timeValue(from: dict) {
+                        if ov.firstTime == nil || time < ov.firstTime! { ov.firstTime = time }
+                        if ov.lastTime == nil || time > ov.lastTime! { ov.lastTime = time }
+                    }
+                    var found = scanner.scan(dict, fields: true,
+                                             tokens: !TokenUsageRules.skipGenericScan(type: t, subtype: sub)).tokens
+                    if t == "token_usage_record" {
+                        found = TokenUsageRules.normalize(TokenUsageRules.exactUsage(dict: dict))
+                    }
+                    for (k, v) in found { ov.tokenTotals[k, default: 0] += v }
+                } else {
+                    scanner.scan(root: obj, fields: true)     // 根是数组/标量：只做字段聚合
                 }
             }
             print(summary(file: file, overview: ov))
             if showFields {
                 print("\n字段路径（前 60，按出现次数；百分比 = 出现次数 ÷ 有效行数，数组元素路径可能超过 100%）：")
-                for f in fa.sortedByCount.prefix(60) {
+                for f in scanner.sortedByCount.prefix(60) {
                     let pct = ov.validLines > 0
                         ? String(format: "%.0f%%", Double(f.count) / Double(ov.validLines) * 100) : "-"
                     print("  \(String(repeating: " ", count: 6 - String(f.count).count))\(f.count) \(pct)\t\(f.path)  [\(f.typesLabel)]")
@@ -388,13 +390,14 @@ enum CLIDebug {
             var targetSeq: Int64?
             var targetRef: [SeqRef] = []
             var number = 0
+            let scanner = LineScanner()
             while let (bytes, _) = reader.nextLine() {
                 number += 1
-                guard let dict = (try? JSONSerialization.jsonObject(with: Data(bytes))) as? [String: Any]
-                else { continue }
-                let row = LineParser.parse(line: bytes, number: number, offset: 0)
+                let decoded = LineParser.parseAndDecode(line: bytes, number: number, offset: 0)
+                let row = decoded.row
                 if number == line { targetSeq = row.seq }
-                let refs = SeqRefScanner.scan(dict)
+                guard let dict = decoded.root else { continue }
+                let refs = scanner.scan(dict, seqs: true).refs
                 if !refs.isEmpty {
                     if number == line { targetRef = refs }
                     refsByLine[number] = refs
@@ -455,9 +458,8 @@ enum CLIDebug {
             var number = 0
             while let (line, _) = reader.nextLine() {
                 number += 1
-                guard let dict = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any]
-                else { continue }
-                pairs.append((LineParser.parse(line: line, number: number, offset: 0), dict))
+                let decoded = LineParser.parseAndDecode(line: line, number: number, offset: 0)
+                if let dict = decoded.root { pairs.append((decoded.row, dict)) }
             }
             let entries = ConversationBuilder.build(pairs)
             var counts: [String: Int] = [:]

@@ -170,102 +170,44 @@ enum LineParser {
     }
 }
 
-// MARK: - 字段路径聚合
+// MARK: - 单次遍历扫描：字段路径聚合 + Token 用量 + sequence 引用
 
-/// 递归聚合所有行里出现过的 key 路径。
-/// - 字典：`a.b.c`
-/// - 数组：元素合并到 `path[*]`（对象元素继续下钻，标量元素按出现累计）
-struct FieldAnalyzer {
-    private(set) var fields: [String: FieldStats] = [:]
-    private(set) var validLines = 0
-    private let maxDepth: Int
-    private let maxArraySample: Int
-
-    init(maxDepth: Int = 8, maxArraySample: Int = 100) {
-        self.maxDepth = maxDepth
-        self.maxArraySample = maxArraySample
-    }
-
-    mutating func accumulate(root: Any) {
-        validLines += 1
-        walk(root, path: "", depth: 0)
-    }
-
-    var sortedByCount: [FieldStats] {
-        fields.values.sorted { $0.count != $1.count ? $0.count > $1.count : $0.path < $1.path }
-    }
-
-    private mutating func walk(_ v: Any, path: String, depth: Int) {
-        if depth >= maxDepth { return }
-        if let dict = v as? [String: Any] {
-            for (k, sub) in dict {
-                let p = path.isEmpty ? k : path + "." + k
-                record(p, type: FieldAnalyzer.typeName(sub), value: sub)
-                walk(sub, path: p, depth: depth + 1)
-            }
-        } else if let arr = v as? [Any] {
-            let sampled = arr.prefix(maxArraySample)
-            let rest = arr.count - sampled.count
-            for el in sampled {
-                if el is [String: Any] || el is [Any] {
-                    walk(el, path: path + "[*]", depth: depth + 1)
-                } else {
-                    record(path + "[*]", type: FieldAnalyzer.typeName(el), value: el)
-                }
-            }
-            if rest > 0 {
-                if var f = fields[path + "[*]"] {
-                    f.example = "…另有 \(rest) 个元素未采样"
-                    fields[path + "[*]"] = f
-                }
-            }
-        }
-    }
-
-    private mutating func record(_ path: String, type: String, value: Any) {
-        var f = fields[path] ?? FieldStats(path: path, count: 0, types: [], example: "")
-        f.count += 1
-        f.types.insert(type)
-        if f.example.isEmpty {
-            switch value {
-            case let s as String:
-                f.example = s.count > 60 ? String(s.prefix(60)) + "…" : s
-            case let n as NSNumber where CFGetTypeID(n) != CFBooleanGetTypeID():
-                f.example = n.stringValue
-            case let b as Bool:
-                f.example = b ? "true" : "false"
-            case is NSNull:
-                f.example = "null"
-            case is [Any]:
-                f.example = "[]"
-            case is [String: Any]:
-                f.example = "{}"
-            default:
-                break
-            }
-        }
-        fields[path] = f
-    }
-
-    static func typeName(_ v: Any) -> String {
-        switch v {
-        case is NSNull: return "null"
-        case is String: return "string"
-        case let n as NSNumber:
-            if CFGetTypeID(n) == CFBooleanGetTypeID() { return "boolean" }
-            return n.doubleValue.truncatingRemainder(dividingBy: 1) == 0 ? "integer" : "number"
-        case is [Any]: return "array"
-        case is [String: Any]: return "object"
-        default: return "other"
-        }
-    }
+/// 一条出向引用：字段路径 + 引用的 seq 集合
+struct SeqRef: Equatable {
+    let path: String
+    let seqs: [Int64]
 }
 
-// MARK: - Token 用量扫描
+/// 对一行的 JSON 对象树只遍历一次，同时完成三件事（各自可以单独开关）：
+///
+/// - **字段路径聚合**：递归聚合 key 路径。字典 `a.b.c`；数组元素合并到 `path[*]`
+///   （对象元素继续下钻，标量元素按出现累计）。
+/// - **Token 用量**：递归查找 token 叶子。同一条记录里同一规范名出现多次时取最小值：
+///   DSH 会在 message.usage 和 stream[].chunk.usage 里重复同一份数据（相等，取谁都一样）；
+///   Codex 的 token_usage_record 同时带单次 usage、轮累计 turn_token_usage、
+///   线程累计 thread_token_usage，取最小即「单次请求」口径，避免把累计值重复累加。
+/// - **sequence 引用**：字段名规范化（小写、去下划线）后按后缀识别——
+///   恰为 `seq` 且在根层级的是自身序号，跳过；嵌套的 `seq` 视为引用；
+///   后缀 `seq`（如 throughSeq）→ 单个数字引用；后缀 `seqs`（如 messageSeqs）→ 数字数组；
+///   后缀 `seqfrom` / `seqto`（如 seq_from/seq_to）→ 同层配对展开为范围（跨度超过 1000 不展开，防爆炸）。
+///
+/// 为什么合成一次：`as? [String: Any]` 每转换一个容器，Foundation 都会新建一个 Swift 字典
+/// 并桥接它全部的键。分成三个分析器各走一遍，等于每行把整棵树转换三遍。
+///
+/// 实例跨行复用：路径按字典树驻留、键名规范化结果有记忆，同一个键只在第一次遇到时计算。
+final class LineScanner {
+    /// 扫描结果
+    struct Result {
+        /// 根对象桥接后的字典（根不是字典时为 nil）；调用方取 payload 等字段直接用它，不必再桥接
+        let root: [String: Any]?
+        /// 规范名（输入/输出/缓存读/缓存写/总量）→ 用量
+        var tokens: [String: Double] = [:]
+        /// 出向 sequence 引用；同层之内范围对排在其它引用之前
+        var refs: [SeqRef] = []
+    }
 
-enum TokenScanner {
-    /// 规范名映射（key 小写、去掉下划线）
-    static let canonical: [String: String] = [
+    /// Token 字段的规范名映射（key 小写、去掉下划线）
+    private static let canonical: [String: String] = [
         "inputtokens": "输入",
         "outputtokens": "输出",
         "cachereadtokens": "缓存读",
@@ -278,28 +220,278 @@ enum TokenScanner {
         "totaltokens": "总量",
     ]
 
-    /// 递归查找 token 用量叶子。同一条记录里同一规范名出现多次时取最小值：
-    /// - DSH 会在 message.usage 和 stream[].chunk.usage 里重复同一份数据（相等，取谁都一样）
-    /// - Codex 的 token_usage_record 同时带单次 usage、轮累计 turn_token_usage、
-    ///   线程累计 thread_token_usage，取最小即"单次请求"口径，避免把累计值重复累加。
-    static func scan(_ v: Any, depth: Int, found: inout [String: Double]) {
-        if depth > 10 { return }
-        if let dict = v as? [String: Any] {
-            for (k, sub) in dict {
-                let canon = canonical[k.replacingOccurrences(of: "_", with: "").lowercased()]
-                if let canon,
-                   let n = sub as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() {
-                    if let cur = found[canon] {
-                        found[canon] = min(cur, n.doubleValue)
-                    } else {
-                        found[canon] = n.doubleValue
-                    }
-                } else {
-                    scan(sub, depth: depth + 1, found: &found)
+    /// seq_from…seq_to 范围的最大跨度
+    private static let maxRangeSpan: Int64 = 1000
+    /// Token / sequence 扫描的嵌套深度上限
+    private static let maxScanDepth = 10
+    /// 值类型名，下标即类型编号
+    private static let typeNames = ["null", "string", "integer", "number", "boolean", "array", "object", "other"]
+    /// 键名记忆表的容量上限：以 id、时间戳等为键的对象不会把表撑大
+    private static let memoLimit = 4096
+
+    private let maxDepth: Int
+    private let maxArraySample: Int
+
+    // 字段统计：紧凑数组 + 类型位掩码，FieldStats 视图在读取时才生成
+    private struct Stat { var count = 0; var types: UInt8 = 0; var example = "" }
+    private var stats: [Stat] = []
+    private var paths: [String] = []
+
+    /// 路径字典树：每个不同的（父路径, 键）只建一个节点、只拼一次路径
+    private final class Node {
+        let path: String
+        var stat: Int? = nil                 // 首次被记录时分配的 stats 下标
+        var children: [String: Node]? = nil
+        var star: Node? = nil                // 数组元素路径 path[*]
+        init(_ path: String) { self.path = path }
+    }
+    private var root = Node("")
+    private(set) var validLines = 0
+
+    // 键名规范化记忆表；tokenMemo 用空串表示「不是 token 键」
+    private var tokenMemo: [String: String] = [:]
+    private var seqMemo: [String: String] = [:]
+
+    init(maxDepth: Int = 8, maxArraySample: Int = 100) {
+        self.maxDepth = maxDepth
+        self.maxArraySample = maxArraySample
+    }
+
+    /// 扫描一个已桥接的字典根。返回根字典本身，方便调用方接着取字段。
+    @discardableResult
+    func scan(_ root: [String: Any], fields: Bool = false, tokens: Bool = false, seqs: Bool = false) -> Result {
+        var res = Result(root: root)
+        if fields { validLines += 1 }
+        walkDict(root, node: self.root, depth: 0, fields: fields, tokens: tokens, seqs: seqs,
+                 tokenOut: &res.tokens, refs: &res.refs)
+        return res
+    }
+
+    /// 扫描任意根（字典、数组或标量）；根是字典时等同于 scan(_:fields:tokens:seqs:)。
+    @discardableResult
+    func scan(root obj: Any, fields: Bool = false, tokens: Bool = false, seqs: Bool = false) -> Result {
+        if let dict = obj as? [String: Any] {
+            return scan(dict, fields: fields, tokens: tokens, seqs: seqs)
+        }
+        var res = Result(root: nil)
+        if fields { validLines += 1 }
+        if let arr = obj as? [Any] {
+            walkArr(arr, node: root, depth: 0, fields: fields, tokens: tokens, seqs: seqs,
+                    tokenOut: &res.tokens, refs: &res.refs)
+        }
+        return res
+    }
+
+    /// 字段聚合结果，按出现次数降序、路径升序
+    var sortedByCount: [FieldStats] {
+        var out: [FieldStats] = []
+        out.reserveCapacity(stats.count)
+        for (i, s) in stats.enumerated() {
+            var types = Set<String>()
+            for b in 0..<Self.typeNames.count where s.types & (1 << UInt8(b)) != 0 {
+                types.insert(Self.typeNames[b])
+            }
+            out.append(FieldStats(path: paths[i], count: s.count, types: types, example: s.example))
+        }
+        return out.sorted { $0.count != $1.count ? $0.count > $1.count : $0.path < $1.path }
+    }
+
+    /// 按路径取一条字段统计
+    func field(_ path: String) -> FieldStats? {
+        sortedByCount.first { $0.path == path }
+    }
+
+    // MARK: 遍历
+
+    private func walkDict(_ d: [String: Any], node: Node, depth: Int,
+                          fields: Bool, tokens: Bool, seqs: Bool,
+                          tokenOut: inout [String: Double], refs: inout [SeqRef]) {
+        // 字段聚合到 maxDepth 层为止，Token / sequence 扫描到 maxScanDepth 层为止
+        let doFields = fields && depth < maxDepth
+        let doTokens = tokens && depth <= Self.maxScanDepth
+        let doSeqs = seqs && depth <= Self.maxScanDepth
+        let isRoot = depth == 0
+        var rangeFrom: Int64?
+        var rangeTo: Int64?
+        var rangeFromKey = ""
+        // 本层的引用先缓冲：范围对要排在同层其它引用之前
+        var local: [SeqRef] = []
+
+        for (k, sub) in d {
+            let kind = Self.kind(sub)
+            // 路径树节点：字段聚合要用；sequence 引用在更深层也靠它拼路径。两者都不做时不必创建
+            let child = (doFields || doSeqs) ? childNode(node, k) : node
+
+            if doFields { record(child, sub, kind) }
+
+            var tokensBelow = doTokens
+            if doTokens, let canon = tokenCanon(k) {
+                if let n = sub as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() {
+                    if let cur = tokenOut[canon] { tokenOut[canon] = Swift.min(cur, n.doubleValue) }
+                    else { tokenOut[canon] = n.doubleValue }
+                    tokensBelow = false            // 命中的 token 叶子不再下钻
                 }
             }
-        } else if let arr = v as? [Any] {
-            for el in arr { scan(el, depth: depth + 1, found: &found) }
+
+            var seqsBelow = doSeqs
+            if doSeqs {
+                let n = seqNorm(k)
+                if n.hasSuffix("seqfrom"), let v = Self.wholeNumber(sub) {
+                    rangeFrom = v
+                    rangeFromKey = Self.join(node.path, k)
+                }
+                if n.hasSuffix("seqto"), let v = Self.wholeNumber(sub) { rangeTo = v }
+                if n == "seq" && isRoot {
+                    seqsBelow = false                // 根级 seq 是自身序号
+                } else if n.hasSuffix("seq") {
+                    seqsBelow = false                // 单个数字引用
+                    if let v = Self.wholeNumber(sub) {
+                        local.append(SeqRef(path: Self.join(node.path, k), seqs: [v]))
+                    }
+                } else if n.hasSuffix("seqs"), kind == 5 {
+                    seqsBelow = false                // 数字数组；值不是数组时照常下钻
+                    let seqs = (sub as! [Any]).compactMap { Self.wholeNumber($0) }
+                    if !seqs.isEmpty { local.append(SeqRef(path: Self.join(node.path, k), seqs: seqs)) }
+                }
+            }
+
+            // 三件事都不需要下钻时连桥接都省掉（例如字段聚合到了深度上限之后）
+            if doFields || tokensBelow || seqsBelow {
+                if let dict = kind == 6 ? sub as? [String: Any] : nil {
+                    walkDict(dict, node: child, depth: depth + 1, fields: doFields,
+                             tokens: tokensBelow, seqs: seqsBelow, tokenOut: &tokenOut, refs: &local)
+                } else if let arr = kind == 5 ? sub as? [Any] : nil {
+                    walkArr(arr, node: child, depth: depth + 1, fields: doFields,
+                            tokens: tokensBelow, seqs: seqsBelow, tokenOut: &tokenOut, refs: &local)
+                }
+            }
+        }
+
+        if let f = rangeFrom, let t = rangeTo, t >= f, t - f <= Self.maxRangeSpan {
+            local.insert(SeqRef(path: rangeFromKey + "…to", seqs: Array(f...t)), at: 0)
+        }
+        refs.append(contentsOf: local)
+    }
+
+    private func walkArr(_ a: [Any], node: Node, depth: Int,
+                         fields: Bool, tokens: Bool, seqs: Bool,
+                         tokenOut: inout [String: Double], refs: inout [SeqRef]) {
+        let doFields = fields && depth < maxDepth
+        let doTokens = tokens && depth <= Self.maxScanDepth
+        let doSeqs = seqs && depth <= Self.maxScanDepth
+        // 数组元素的路径树节点：字段聚合同它记录 path[*]，sequence 引用靠它拼出 path[*].key
+        let star = (doFields || doSeqs) ? starNode(node) : node
+        // 字段聚合只采样前 maxArraySample 个元素；Token / sequence 扫描走全部元素
+        let sampled = doFields ? min(a.count, maxArraySample) : 0
+        if doFields {
+            for i in 0..<sampled {
+                let el = a[i]
+                let kind = Self.kind(el)
+                if kind != 5 && kind != 6 { record(star, el, kind) }    // 容器元素由下面的递归处理
+            }
+            if a.count > sampled, let i = star.stat {
+                stats[i].example = "…另有 \(a.count - sampled) 个元素未采样"
+            }
+        }
+        let limit = (doTokens || doSeqs) ? a.count : sampled
+        for i in 0..<limit {
+            let el = a[i]
+            let kind = Self.kind(el)
+            if let dict = kind == 6 ? el as? [String: Any] : nil {
+                walkDict(dict, node: star, depth: depth + 1, fields: i < sampled,
+                         tokens: doTokens, seqs: doSeqs, tokenOut: &tokenOut, refs: &refs)
+            } else if let arr = kind == 5 ? el as? [Any] : nil {
+                walkArr(arr, node: star, depth: depth + 1, fields: i < sampled,
+                        tokens: doTokens, seqs: doSeqs, tokenOut: &tokenOut, refs: &refs)
+            }
+        }
+    }
+
+    // MARK: 字段统计与路径树
+
+    @inline(__always) private func record(_ n: Node, _ v: Any, _ kind: UInt8) {
+        let i: Int
+        if let s = n.stat {
+            i = s
+        } else {
+            stats.append(Stat())
+            paths.append(n.path)
+            i = stats.count - 1
+            n.stat = i
+        }
+        stats[i].count += 1
+        stats[i].types |= 1 << kind
+        if stats[i].example.isEmpty { stats[i].example = Self.example(v, kind) }
+    }
+
+    @inline(__always) private func childNode(_ node: Node, _ k: String) -> Node {
+        if let c = node.children?[k] { return c }
+        let c = Node(Self.join(node.path, k))
+        if node.children == nil { node.children = [:] }
+        node.children![k] = c
+        return c
+    }
+
+    @inline(__always) private func starNode(_ node: Node) -> Node {
+        if let s = node.star { return s }
+        let s = Node(node.path + "[*]")
+        node.star = s
+        return s
+    }
+
+    @inline(__always) private static func join(_ path: String, _ k: String) -> String {
+        path.isEmpty ? k : path + "." + k
+    }
+
+    @inline(__always) private func tokenCanon(_ key: String) -> String? {
+        if let memo = tokenMemo[key] { return memo.isEmpty ? nil : memo }
+        let canon = Self.canonical[key.lowercased().replacingOccurrences(of: "_", with: "")]
+        if tokenMemo.count < Self.memoLimit { tokenMemo[key] = canon ?? "" }
+        return canon
+    }
+
+    @inline(__always) private func seqNorm(_ key: String) -> String {
+        if let memo = seqMemo[key] { return memo }
+        let norm = key.lowercased().replacingOccurrences(of: "_", with: "")
+        if seqMemo.count < Self.memoLimit { seqMemo[key] = norm }
+        return norm
+    }
+
+    /// 值的类型编号（typeNames 的下标），用 CFGetTypeID 判型。
+    ///
+    /// 不要写成 `v is NSNull` / `v is String`：从 `Any` 转到具体类型走的是运行时的慢路径
+    /// （实测每次 200–400 ns，而这里每个节点都要调用），`is [String: Any]` 还会顺带把容器桥接一遍。
+    /// CFGetTypeID 对任意对象都安全：NSNull 有独立编号，其余对象（URL、日期、纯 Swift 值）归入「其它」。
+    @inline(__always) private static func kind(_ v: Any) -> UInt8 {
+        switch CFGetTypeID(v as CFTypeRef) {
+        case CFNullGetTypeID(): return 0
+        case CFStringGetTypeID(): return 1
+        case CFNumberGetTypeID():
+            return (v as! NSNumber).doubleValue.truncatingRemainder(dividingBy: 1) == 0 ? 2 : 3
+        case CFBooleanGetTypeID(): return 4
+        case CFArrayGetTypeID(): return 5
+        case CFDictionaryGetTypeID(): return 6
+        default: return 7
+        }
+    }
+
+    /// 整数值的 NSNumber（布尔不算）→ Int64；与行序号、seq 同口径
+    private static func wholeNumber(_ v: Any) -> Int64? {
+        guard CFGetTypeID(v as CFTypeRef) == CFNumberGetTypeID() else { return nil }
+        return (v as! NSNumber).int64Value
+    }
+
+    private static func example(_ v: Any, _ kind: UInt8) -> String {
+        switch kind {
+        case 1:
+            let s = v as! String
+            return s.count > 60 ? String(s.prefix(60)) + "…" : s
+        case 2, 3: return (v as! NSNumber).stringValue
+        case 4: return (v as! NSNumber).boolValue ? "true" : "false"
+        case 0: return "null"
+        case 5: return "[]"
+        case 6: return "{}"
+        default: return ""
         }
     }
 }
@@ -410,89 +602,6 @@ enum CallRefScanner {
               let callId = payload["call_id"] as? String, !callId.isEmpty else { return nil }
         let role: CallRef.Role = variant.hasSuffix("_output") ? .output : .call
         return CallRef(callId: callId, role: role, variant: variant)
-    }
-}
-
-// MARK: - DSH sequence 引用扫描
-
-/// 一条出向引用：字段路径 + 引用的 seq 集合
-struct SeqRef: Equatable {
-    let path: String
-    let seqs: [Int64]
-}
-
-/// 扫描 DSH 事件里的 sequence 引用。字段名规范化（小写、去下划线）后按后缀识别：
-/// - 恰为 "seq" 且在根层级 → 自身序号，跳过；嵌套的 "seq" 视为引用
-/// - 后缀 "seq"（如 throughSeq）→ 单个数字引用
-/// - 后缀 "seqs"（如 messageSeqs / sourceEventSeqs）→ 数字数组
-/// - 后缀 "seqfrom" / "seqto"（如 seq_from/seq_to、event_seq_from/event_seq_to）
-///   → 同层配对展开为范围（跨度超过 1000 不展开，防爆炸）
-enum SeqRefScanner {
-    static let maxRangeSpan: Int64 = 1000
-
-    static func normalized(_ key: String) -> String {
-        key.lowercased().replacingOccurrences(of: "_", with: "")
-    }
-
-    static func isNumber(_ v: Any) -> Int64? {
-        if let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() {
-            return n.int64Value
-        }
-        return nil
-    }
-
-    static func scan(_ root: [String: Any]) -> [SeqRef] {
-        var out: [SeqRef] = []
-        walk(root, path: "", isRoot: true, depth: 0, out: &out)
-        return out
-    }
-
-    private static func walk(_ v: Any, path: String, isRoot: Bool, depth: Int,
-                             out: inout [SeqRef]) {
-        guard depth <= 10 else { return }
-        if let dict = v as? [String: Any] {
-            // 先收集 from/to 范围对（同层配对，与遍历顺序无关）
-            var rangeFrom: Int64?
-            var rangeFromKey = ""
-            var rangeTo: Int64?
-            for (k, sub) in dict {
-                let n = normalized(k)
-                if n.hasSuffix("seqfrom"), let val = isNumber(sub) {
-                    rangeFrom = val
-                    rangeFromKey = path.isEmpty ? k : path + "." + k
-                }
-                if n.hasSuffix("seqto"), let val = isNumber(sub) {
-                    rangeTo = val
-                }
-            }
-            if let f = rangeFrom, let t = rangeTo, t >= f, t - f <= maxRangeSpan {
-                out.append(SeqRef(path: rangeFromKey + "…to", seqs: Array(f...t)))
-            }
-
-            for (k, sub) in dict {
-                let p = path.isEmpty ? k : path + "." + k
-                let n = normalized(k)
-                if n == "seq" && isRoot {
-                    continue   // 根级 seq 是自身序号
-                }
-                if n.hasSuffix("seqs"), let arr = sub as? [Any] {
-                    let seqs = arr.compactMap { isNumber($0) }
-                    if !seqs.isEmpty { out.append(SeqRef(path: p, seqs: seqs)) }
-                } else if n.hasSuffix("seq") || n == "seq" {
-                    if let val = isNumber(sub) {
-                        out.append(SeqRef(path: p, seqs: [val]))
-                    }
-                } else if sub is [String: Any] || sub is [Any] {
-                    walk(sub, path: p, isRoot: false, depth: depth + 1, out: &out)
-                }
-            }
-        } else if let arr = v as? [Any] {
-            for el in arr {
-                if el is [String: Any] || el is [Any] {
-                    walk(el, path: path + "[*]", isRoot: false, depth: depth + 1, out: &out)
-                }
-            }
-        }
     }
 }
 

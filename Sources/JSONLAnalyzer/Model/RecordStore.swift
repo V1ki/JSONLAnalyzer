@@ -95,7 +95,8 @@ final class RecordStore: ObservableObject {
             var rows: [RecordRow] = []
             rows.reserveCapacity(4096)
             var ov = OverviewStats()
-            var fa = FieldAnalyzer()
+            // 跨行复用：字段路径树与键名记忆表只在第一次遇到时计算
+            let scanner = LineScanner()
             var points: [TokenPoint] = []
             var intern: [String: String] = [:]
             var idx = ParseIndexes()
@@ -111,22 +112,26 @@ final class RecordStore: ObservableObject {
 
                 if !row.isInvalid, let data = decoded.object {
                     ov.validLines += 1
-                    fa.accumulate(root: data)
+                    // Token 口径：token_usage_record 只认 payload.usage；token_count/compacted 是累计快照，跳过
+                    let scanTokens = !TokenUsageRules.skipGenericScan(type: row.type, subtype: row.subtype)
+                    // 一次遍历完成字段聚合、Token 扫描与 sequence 引用扫描。
+                    // Token / sequence 的口径都以根是字典为前提，根是数组/标量时只做字段聚合。
+                    let scanned: LineScanner.Result
+                    if let dict = decoded.root {
+                        scanned = scanner.scan(dict, fields: true, tokens: scanTokens, seqs: true)
+                    } else {
+                        scanned = scanner.scan(root: data, fields: true)
+                    }
+                    var found = scanned.tokens
                     if let t = row.type { intern[t] = (intern[t] ?? t); row.type = intern[t] }
                     if let time = row.time {
                         if ov.firstTime == nil || time < ov.firstTime! { ov.firstTime = time }
                         if ov.lastTime == nil || time > ov.lastTime! { ov.lastTime = time }
                     }
                     if let dict = decoded.root {
-                        // Token 口径：token_usage_record 只认 payload.usage；
-                        // token_count/compacted 是累计快照，跳过
-                        var found: [String: Double] = [:]
                         if row.type == "token_usage_record" {
                             found = TokenUsageRules.normalize(
                                 TokenUsageRules.exactUsage(dict: dict))
-                        } else if !TokenUsageRules.skipGenericScan(type: row.type,
-                                                                   subtype: row.subtype) {
-                            TokenScanner.scan(dict, depth: 0, found: &found)
                         }
                         if !found.isEmpty {
                             for (k, v) in found { ov.tokenTotals[k, default: 0] += v }
@@ -137,7 +142,7 @@ final class RecordStore: ObservableObject {
                             }
                         }
                         // DSH sequence 引用索引
-                        let rowRefList = SeqRefScanner.scan(dict)
+                        let rowRefList = scanned.refs
                         if !rowRefList.isEmpty {
                             idx.rowRefs[number] = rowRefList
                             for r in rowRefList {
@@ -202,7 +207,7 @@ final class RecordStore: ObservableObject {
             }
 
             let durs = DurationAnalyzer.pair(rows)
-            let sortedFields = fa.sortedByCount
+            let sortedFields = scanner.sortedByCount
             await self?.finish(.done, rows: rows, overview: ov,
                                fields: sortedFields, durations: durs, points: points,
                                indexes: idx, generation: generation)
