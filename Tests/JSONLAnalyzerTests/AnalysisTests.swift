@@ -516,4 +516,51 @@ final class AnalysisTests: XCTestCase {
         XCTAssertEqual(got[1].1, 8)   // {"a":1}\n = 8 字节
         XCTAssertEqual(got[2].1, 17)
     }
+
+    // MARK: 回归：切换文件后，旧筛选任务迟到的结果覆盖列表
+
+    private func writeTemp(_ lines: [String]) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ja-test-\(UUID().uuidString).jsonl")
+        try lines.joined(separator: "\n").data(using: .utf8)!.write(to: url)
+        return url
+    }
+
+    @MainActor
+    private func waitUntilLoaded(_ store: RecordStore) async {
+        let deadline = Date().addingTimeInterval(20)
+        while case .loading = store.state, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+    }
+
+    @MainActor
+    func testStaleFilterDoesNotOverwriteNewFile() async throws {
+        // 4 万行的文件上发起一次较慢的筛选，立刻切到 50 行的小文件
+        let big = try JsonlFile.prepare(writeTemp((0..<40_000).map {
+            #"{"type":"row-\#($0 % 7)","seq":\#($0),"text":"preview text number \#($0)"}"#
+        }))
+        let small = try JsonlFile.prepare(writeTemp((0..<50).map {
+            #"{"type":"small-\#($0)","seq":\#($0)}"#
+        }))
+        defer {
+            try? FileManager.default.removeItem(at: big.url)
+            try? FileManager.default.removeItem(at: small.url)
+        }
+
+        let store = RecordStore()
+        store.load(big)
+        await waitUntilLoaded(store)
+        XCTAssertEqual(store.rows.count, 40_000)
+
+        store.filter.searchText = "a"
+        store.load(small)
+        await waitUntilLoaded(store)
+        // 留出时间让旧筛选任务（如果没被拦下）迟到
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        XCTAssertEqual(store.rows.count, 50)
+        XCTAssertEqual(store.visibleRows.count, 50)
+        XCTAssertEqual(store.visibleRows.first?.type, "small-0")
+    }
 }

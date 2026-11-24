@@ -64,6 +64,11 @@ final class RecordStore: ObservableObject {
     private(set) var file: JsonlFile?
     private var loadTask: Task<Void, Never>?
     private var filterTask: Task<Void, Never>?
+    /// 每次 load / beginPreparing 递增。cancel() 只能让任务在下一次检查时停下，
+    /// 手里那一轮已经算完的结果仍会送达——publish / finish 按这个编号丢弃迟到的那一份。
+    private var loadGeneration = 0
+    /// 每次 recomputeVisible 递增，作用同上：被取代的筛选任务迟到的结果不覆盖当前列表。
+    private var filterGeneration = 0
 
     var availableTypes: [(String, Int)] {
         overview.typeCounts.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
@@ -73,6 +78,8 @@ final class RecordStore: ObservableObject {
     func load(_ f: JsonlFile) {
         loadTask?.cancel()
         filterTask?.cancel()
+        loadGeneration += 1
+        let generation = loadGeneration
         file = f
         rows = []; visibleRows = []; fields = []; durations = []; tokenPoints = []
         indexes = ParseIndexes()
@@ -82,7 +89,7 @@ final class RecordStore: ObservableObject {
 
         loadTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let reader = f.openReader() else {
-                await self?.finish(.error("无法打开文件：\(f.dataURL.path)"))
+                await self?.finish(.error("无法打开文件：\(f.dataURL.path)"), generation: generation)
                 return
             }
             var rows: [RecordRow] = []
@@ -183,7 +190,8 @@ final class RecordStore: ObservableObject {
                     published = number
                     let progress = reader.totalBytes > 0
                         ? Double(reader.consumedBytes) / Double(reader.totalBytes) : 0
-                    await self?.publish(rows: rows, overview: ov, progress: min(progress, 0.999))
+                    await self?.publish(rows: rows, overview: ov, progress: min(progress, 0.999),
+                                        generation: generation)
                 }
             }
             if Task.isCancelled { return }
@@ -195,7 +203,7 @@ final class RecordStore: ObservableObject {
             let sortedFields = fa.sortedByCount
             await self?.finish(.done, rows: rows, overview: ov,
                                fields: sortedFields, durations: durs, points: points,
-                               indexes: idx)
+                               indexes: idx, generation: generation)
         }
     }
 
@@ -230,10 +238,11 @@ final class RecordStore: ObservableObject {
     func beginPreparing() {
         loadTask?.cancel()
         filterTask?.cancel()
+        loadGeneration += 1
         rows = []; visibleRows = []; fields = []; durations = []; tokenPoints = []
         indexes = ParseIndexes()
         overview = OverviewStats()
-        filter = RecordFilter()
+        filter = RecordFilter()      // didSet → recomputeVisible()，在途的筛选任务随之失效
         state = .loading(progress: 0, lines: 0)
     }
 
@@ -242,16 +251,20 @@ final class RecordStore: ObservableObject {
         state = .error(message)
     }
 
-    private func publish(rows: [RecordRow], overview: OverviewStats, progress: Double) {
+    private func publish(rows: [RecordRow], overview: OverviewStats, progress: Double,
+                         generation: Int) {
+        guard generation == loadGeneration else { return }
         self.rows = rows
         self.overview = overview
-        self.state = .loading(progress: progress, lines: rows.count)
+        state = .loading(progress: progress, lines: rows.count)
         recomputeVisible()
     }
 
     private func finish(_ s: LoadState, rows: [RecordRow] = [], overview: OverviewStats = OverviewStats(),
                         fields: [FieldStats] = [], durations: [DurationEntry] = [],
-                        points: [TokenPoint] = [], indexes: ParseIndexes = ParseIndexes()) {
+                        points: [TokenPoint] = [], indexes: ParseIndexes = ParseIndexes(),
+                        generation: Int) {
+        guard generation == loadGeneration else { return }
         state = s
         if case .done = s {
             self.rows = rows
@@ -268,11 +281,15 @@ final class RecordStore: ObservableObject {
         let src = rows
         let f = filter
         filterTask?.cancel()
+        filterGeneration += 1
+        let generation = filterGeneration
         filterTask = Task.detached(priority: .userInitiated) { [weak self] in
             var out: [RecordRow] = []
             out.reserveCapacity(src.count)
             let needle = f.searchText.lowercased()
             for r in src {
+                // 输入还在变化：尽早停下，列表由最新一代筛选任务负责
+                if Task.isCancelled { return }
                 if f.invalidOnly && !r.isInvalid { continue }
                 if !f.types.isEmpty {
                     guard let t = r.type, f.types.contains(t) else { continue }
@@ -283,9 +300,12 @@ final class RecordStore: ObservableObject {
                 }
                 out.append(r)
             }
-            await self?.setVisible(out)
+            await self?.setVisible(out, generation: generation)
         }
     }
 
-    private func setVisible(_ v: [RecordRow]) { visibleRows = v }
+    private func setVisible(_ v: [RecordRow], generation: Int) {
+        guard generation == filterGeneration else { return }
+        visibleRows = v
+    }
 }
