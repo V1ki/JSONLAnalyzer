@@ -151,6 +151,7 @@ final class LineReader {
     private var baseOffset: UInt64 = 0  // buf[0] 对应的文件偏移
     let totalBytes: Int64
     private(set) var consumedBytes: Int64 = 0
+    private static let chunkSize = 1 << 16
 
     init?(url: URL, totalBytes: Int64) {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
@@ -169,14 +170,18 @@ final class LineReader {
                 consumedBytes = Int64(baseOffset) + Int64(pos)
                 return (line, start)
             }
-            // 缓冲区中没有换行符：压缩掉已消费前缀，继续读
-            if pos > 0 {
-                buf.removeFirst(min(pos, buf.count))
+            // 缓冲区里没有换行符：腾出空间，继续读。
+            // 只有已消费部分过半才前移剩余数据（搬动量不超过腾出的空间）；
+            // 否则直接追加——长行跨越很多块时，不必每读一块就整体搬动一次。
+            if pos > 0, pos * 2 >= buf.count {
+                buf.removeFirst(pos)
                 baseOffset += UInt64(pos)
                 consumedBytes = Int64(baseOffset)
                 pos = 0
             }
-            guard let chunk = try? handle.read(upToCount: 1 << 16), !chunk.isEmpty else {
+            // 一次读取量随未成行的数据增长：长行只需对数次数的读取
+            let want = max(Self.chunkSize, buf.count - pos)
+            guard let chunk = try? handle.read(upToCount: want), !chunk.isEmpty else {
                 if pos < buf.count {
                     // 文件末尾没有换行符的最后一行
                     let start = baseOffset + UInt64(pos)

@@ -535,6 +535,79 @@ final class AnalysisTests: XCTestCase {
         XCTAssertEqual(got[2].1, 17)
     }
 
+    func testLineReaderMatchesReferenceOnMixedContent() throws {
+        // 确定性伪随机内容：空行、短行、跨越多个 64KB 块的长行，以及末尾不带换行的最后一行
+        var state: UInt64 = 0x9E3779B97F4A7C15
+        func next() -> UInt64 {
+            state &+= 0x9E3779B97F4A7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+            return z ^ (z >> 31)
+        }
+        // 最高位置 1，保证生成的字节不会与换行符混淆
+        func body(_ upper: UInt64) -> [UInt8] {
+            (0..<Int(next() % upper)).map { _ in UInt8(truncatingIfNeeded: next() | 0x80) }
+        }
+        var expected: [(offset: Int, length: Int)] = []
+        var bytes: [UInt8] = []
+        func appendLine(_ b: [UInt8]) {
+            expected.append((bytes.count, b.count))
+            bytes.append(contentsOf: b)
+            bytes.append(0x0A)
+        }
+        for _ in 0..<700 {
+            switch next() % 10 {
+            case 0: appendLine([])
+            case 1...6: appendLine(body(300))
+            default: appendLine(body(300_000))
+            }
+        }
+        let last = body(100_000)
+        expected.append((bytes.count, last.count))   // 末行不带换行
+        bytes.append(contentsOf: last)
+
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ja-reader-\(UUID().uuidString).bin")
+        try Data(bytes).write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let reader = try XCTUnwrap(LineReader(url: tmp, totalBytes: Int64(bytes.count)))
+        var got: [(offset: UInt64, length: Int, same: Bool)] = []
+        while let (line, offset) = reader.nextLine() {
+            let e = expected[got.count]
+            got.append((offset, line.count, Array(line) == Array(bytes[e.offset..<(e.offset + e.length)])))
+        }
+        XCTAssertEqual(got.count, expected.count)
+        XCTAssertEqual(got.map(\.offset), expected.map { UInt64($0.offset) })
+        XCTAssertEqual(got.map(\.length), expected.map(\.length))
+        XCTAssertTrue(got.allSatisfy(\.same))
+        XCTAssertNil(reader.nextLine())
+        XCTAssertEqual(reader.consumedBytes, Int64(bytes.count))
+    }
+
+    func testLineReaderKeepsEarlierLinesValid() throws {
+        // 已取出的行留到后续读取之后仍然有效：缓冲区扩充或前移不能改写它
+        var lines = (0..<3000).map { #"{"seq":\#($0),"text":"\#(String(repeating: "x", count: 60))"}"# }
+        lines[1500] = #"{"seq":1500,"text":"\#(String(repeating: "y", count: 200_000))"}"#
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ja-reader-\(UUID().uuidString).jsonl")
+        try lines.joined(separator: "\n").data(using: .utf8)!.write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let reader = try XCTUnwrap(LineReader(url: tmp, totalBytes: Int64((try tmp.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0)))
+        var kept: [ArraySlice<UInt8>] = []
+        var copies: [String] = []
+        while let (line, _) = reader.nextLine() {
+            kept.append(line)
+            copies.append(String(decoding: line, as: UTF8.self))
+        }
+        XCTAssertEqual(kept.count, lines.count)
+        for (slice, copy) in zip(kept, copies) {
+            XCTAssertEqual(String(decoding: slice, as: UTF8.self), copy)
+        }
+    }
+
     // MARK: 回归：切换文件后，旧筛选任务迟到的结果覆盖列表
 
     private func writeTemp(_ lines: [String]) throws -> URL {
