@@ -716,6 +716,54 @@ final class AnalysisTests: XCTestCase {
         XCTAssertEqual(body("短文本"), "短文本")
     }
 
+    // MARK: 文本页缓存
+
+    func testTextTabCacheReadsAndRendersOnce() throws {
+        let short = "这是一段短文本内容"                                        // 字段名 text，≥ 8 字符
+        let long = String(repeating: "长", count: TextTabCache.syncRenderLimit + 100)
+        let filler = String(repeating: " ", count: TextTabCache.syncReadLimit + 1000)   // 把第 2 行撑过同步读取上限
+        let url = try writeTemp([
+            #"{"type":"a","text":"\#(short)","body":"\#(long)"}"#,
+            #"{"type":"b","text":"\#(short)","pad":"\#(filler)"}"#,
+        ])
+        defer { try? FileManager.default.removeItem(at: url) }
+        let file = try JsonlFile.prepare(url)
+        let reader = try XCTUnwrap(file.openReader())
+        var rows: [RecordRow] = []
+        while let (line, offset) = reader.nextLine() {
+            rows.append(LineParser.parseAndDecode(line: line, number: rows.count + 1, offset: offset).row)
+        }
+        XCTAssertEqual(rows.count, 2)
+        let cache = TextTabCache()
+
+        // 小行：同步读出；大行：同步读取返回 nil，等后台结果存进来
+        let small = try XCTUnwrap(cache.candidates(for: rows[0], file: file))
+        XCTAssertEqual(Set(small.map(\.path)), ["text", "body"])
+        XCTAssertNil(cache.candidates(for: rows[1], file: file))
+        cache.setCandidates([TextCandidate(path: "text", text: short)], for: rows[1].id)
+        XCTAssertEqual(cache.candidates(for: rows[1], file: file)?.map(\.path), ["text"])
+
+        // 短文本同步渲染；长文本等后台渲染结果
+        let shortCand = try XCTUnwrap(small.first { $0.path == "text" })
+        let longCand = try XCTUnwrap(small.first { $0.path == "body" })
+        XCTAssertNotNil(cache.rendered(shortCand, for: rows[0]))
+        XCTAssertNil(cache.rendered(longCand, for: rows[0]))
+        cache.setRendered(TextRender.prepare(longCand, limit: TextTabCache.renderLimit), for: rows[0])
+        XCTAssertNotNil(cache.rendered(longCand, for: rows[0]))
+
+        // 文件删了也还能取到：说明后续读取走的是缓存，没有再读文件
+        try FileManager.default.removeItem(at: url)
+        XCTAssertEqual(cache.candidates(for: rows[0], file: file)?.count, 2)
+        XCTAssertNotNil(cache.rendered(shortCand, for: rows[0]))
+
+        // 重新加载（代数变化）后缓存失效：文件已不存在，读出来是空；同一个代数不清缓存
+        cache.sync(token: 1)
+        XCTAssertEqual(cache.candidates(for: rows[0], file: file)?.count, 0)
+        cache.setCandidates([TextCandidate(path: "x", text: short)], for: rows[0].id)
+        cache.sync(token: 1)
+        XCTAssertEqual(cache.candidates(for: rows[0], file: file)?.count, 1)
+    }
+
     // MARK: LineReader
 
     func testLineReaderOffsets() throws {

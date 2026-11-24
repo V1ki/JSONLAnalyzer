@@ -66,7 +66,8 @@ final class RecordStore: ObservableObject {
     private var filterTask: Task<Void, Never>?
     /// 每次 load / beginPreparing 递增。cancel() 只能让任务在下一次检查时停下，
     /// 手里那一轮已经算完的结果仍会送达——publish / finish 按这个编号丢弃迟到的那一份。
-    private var loadGeneration = 0
+    /// 视图层也用它判断「是不是又加载了一次」，让按行缓存的结果失效。
+    private(set) var loadGeneration = 0
     /// 每次 recomputeVisible 递增，作用同上：被取代的筛选任务迟到的结果不覆盖当前列表。
     private var filterGeneration = 0
 
