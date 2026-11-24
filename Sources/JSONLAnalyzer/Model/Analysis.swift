@@ -114,8 +114,18 @@ enum LineParser {
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// 解析一行。永不抛错：坏行返回 isInvalid = true。
-    static func parse(line: ArraySlice<UInt8>, number: Int, offset: UInt64) -> RecordRow {
+    /// parseAndDecode 的结果。
+    struct DecodedLine {
+        let row: RecordRow
+        /// 解析成功的 JSON 值（空行、损坏行为 nil）
+        let object: Any?
+        /// object 是字典时桥接好的根字典；调用方取 payload 等字段时直接复用，不必再桥接一次
+        let root: [String: Any]?
+    }
+
+    /// 解析一行并一并返回解析出的对象。永不抛错：坏行返回 isInvalid = true、object = nil。
+    /// 需要对象树的调用方（字段聚合、索引构建）必须复用这里的 object，不要再解析一遍。
+    static func parseAndDecode(line: ArraySlice<UInt8>, number: Int, offset: UInt64) -> DecodedLine {
         let preview = makePreview(line)
         func row(type: String?, subtype: String? = nil, seq: Int64? = nil, time: Date? = nil,
                  invalid: Bool = false, message: String? = nil) -> RecordRow {
@@ -125,7 +135,7 @@ enum LineParser {
         }
 
         if line.allSatisfy({ $0 == 0x20 || $0 == 0x09 || $0 == 0x0D }) {
-            return row(type: nil, invalid: true, message: "空行")
+            return DecodedLine(row: row(type: nil, invalid: true, message: "空行"), object: nil, root: nil)
         }
 
         do {
@@ -133,7 +143,7 @@ enum LineParser {
             guard let dict = obj as? [String: Any] else {
                 let kind: String
                 if obj is [Any] { kind = "(数组)" } else { kind = "(标量)" }
-                return row(type: kind, time: nil)
+                return DecodedLine(row: row(type: kind, time: nil), object: obj, root: nil)
             }
             // DSH 用 seq，Codex 用 ordinal（顶层可选）
             var seq = (dict["seq"] as? NSNumber)?.int64Value
@@ -144,12 +154,19 @@ enum LineParser {
                let pt = payload["type"] as? String, !pt.isEmpty {
                 subtype = pt
             }
-            return row(type: typeValue(from: dict), subtype: subtype,
-                       seq: seq, time: timeValue(from: dict))
+            return DecodedLine(
+                row: row(type: typeValue(from: dict), subtype: subtype,
+                         seq: seq, time: timeValue(from: dict)),
+                object: obj, root: dict)
         } catch {
             let msg = error.localizedDescription.prefix(160).description
-            return row(type: nil, invalid: true, message: msg)
+            return DecodedLine(row: row(type: nil, invalid: true, message: msg), object: nil, root: nil)
         }
+    }
+
+    /// 解析一行。永不抛错：坏行返回 isInvalid = true。
+    static func parse(line: ArraySlice<UInt8>, number: Int, offset: UInt64) -> RecordRow {
+        parseAndDecode(line: line, number: number, offset: offset).row
     }
 }
 

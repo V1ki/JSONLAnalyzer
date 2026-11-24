@@ -105,9 +105,11 @@ final class RecordStore: ObservableObject {
             while let (line, offset) = reader.nextLine() {
                 if Task.isCancelled { return }
                 number += 1
-                var row = LineParser.parse(line: line, number: number, offset: offset)
+                // 解析一次：行摘要、对象树、根字典都从这里来，后面不再重复解析
+                let decoded = LineParser.parseAndDecode(line: line, number: number, offset: offset)
+                var row = decoded.row
 
-                if !row.isInvalid, let data = try? JSONSerialization.jsonObject(with: Data(line)) {
+                if !row.isInvalid, let data = decoded.object {
                     ov.validLines += 1
                     fa.accumulate(root: data)
                     if let t = row.type { intern[t] = (intern[t] ?? t); row.type = intern[t] }
@@ -115,7 +117,7 @@ final class RecordStore: ObservableObject {
                         if ov.firstTime == nil || time < ov.firstTime! { ov.firstTime = time }
                         if ov.lastTime == nil || time > ov.lastTime! { ov.lastTime = time }
                     }
-                    if let dict = data as? [String: Any] {
+                    if let dict = decoded.root {
                         // Token 口径：token_usage_record 只认 payload.usage；
                         // token_count/compacted 是累计快照，跳过
                         var found: [String: Double] = [:]

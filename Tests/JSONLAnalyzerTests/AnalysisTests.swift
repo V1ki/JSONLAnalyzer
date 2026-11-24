@@ -46,6 +46,24 @@ final class AnalysisTests: XCTestCase {
         XCTAssertEqual(row.type, "(数组)")
     }
 
+    func testParseAndDecodeReturnsObjectAndRoot() {
+        let dict = LineParser.parseAndDecode(line: Array(#"{"type":"a","seq":3}"#.utf8)[...], number: 1, offset: 0)
+        XCTAssertEqual(dict.row.type, "a")
+        XCTAssertEqual((dict.object as? [String: Any])?["seq"] as? Int, 3)
+        XCTAssertEqual(dict.root?["type"] as? String, "a")
+
+        // JSON Lines 允许一行就是一个值：标量根是有效行，与列表里的显示一致
+        let scalar = LineParser.parseAndDecode(line: Array("123".utf8)[...], number: 2, offset: 0)
+        XCTAssertFalse(scalar.row.isInvalid)
+        XCTAssertEqual(scalar.row.type, "(标量)")
+        XCTAssertEqual(scalar.object as? Int, 123)
+        XCTAssertNil(scalar.root)
+
+        let broken = LineParser.parseAndDecode(line: Array(#"{"a":"#.utf8)[...], number: 3, offset: 0)
+        XCTAssertTrue(broken.row.isInvalid)
+        XCTAssertNil(broken.object)
+    }
+
     // MARK: FieldAnalyzer
 
     func testFieldAggregation() {
