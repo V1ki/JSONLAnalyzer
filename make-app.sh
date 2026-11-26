@@ -14,6 +14,10 @@ mkdir -p "$APP/Contents/MacOS"
 
 cp "$BIN" "$APP/Contents/MacOS/JSONLAnalyzer"
 
+# App 图标：由 Scripts/MakeIcon.swift 画出来，改动后重新运行它即可
+mkdir -p "$APP/Contents/Resources"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -27,6 +31,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <string>JSONLAnalyzer</string>
     <key>CFBundleIdentifier</key>
     <string>com.v1ki.jsonl-analyzer</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

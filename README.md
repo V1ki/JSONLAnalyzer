@@ -1,5 +1,7 @@
 # JSONL Analyzer
 
+<img src="Resources/AppIcon.png" width="128" height="128" alt="JSONL Analyzer 的 App 图标" align="right" />
+
 macOS 原生（Swift / SwiftUI）的 JSONL 文件分析工具，面向 DSH / Codex 等会话日志，
 也适用于任意 JSONL。
 
@@ -87,6 +89,19 @@ swift test             # 单元测试（62 个）
 
 双击 `JSONL Analyzer.app`，或在 Finder 里把 `.jsonl` / `.zstd` 拖到 App 图标上打开。
 
+### App 图标
+
+图标是用代码画的（`Scripts/MakeIcon.swift`）：一对花括号里装着一个对话气泡——JSON 里装着一段对话。
+生成好的图标放在 `Resources/`，平时不用管；想换构图或配色时：
+
+```bash
+swift Scripts/MakeIcon.swift compare /tmp/icons.png   # 几种构图和配色并排的对比图
+swift Scripts/MakeIcon.swift build bracesDots deepBlue # 按方案重新生成（可选值见脚本开头，不带参数是定稿）
+./make-app.sh                                         # 重新打包
+```
+
+每个尺寸都是单独绘制的，不是把大图缩小，所以 16 像素下线条仍然清楚。底板的轮廓必须和系统图标的
+形状一致：四角哪怕只是画得圆了一点，系统就会把整个图标当成「内容」，缩进一个灰色底板里显示。
 
 ## 命令行模式（顺手可用，非主打）
 
@@ -127,6 +142,8 @@ Sources/JSONLAnalyzer/
   Views/                    三栏窗口、侧栏、记录列表、详情（会话/记录/关联/文本/概览/字段/时间线）
     ChatBodyCache.swift     会话正文的 Markdown 渲染缓存（后台渲染、折叠、分列表格）
 Tests/JSONLAnalyzerTests/   解析、扫描、读取器、会话还原、缓存与加载状态机的单元测试
+Resources/                  App 图标：AppIcon.icns / .png 与各尺寸预览图，由 Scripts/MakeIcon.swift 生成
+Scripts/MakeIcon.swift      用代码画图标：每个尺寸单独绘制，再用 iconutil 打包成 .icns
 make-app.sh                 打包 .app
 ```
 
