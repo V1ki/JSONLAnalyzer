@@ -17,12 +17,23 @@ macOS 原生（Swift / SwiftUI）的 JSONL 文件分析工具，面向 DSH / Cod
 - **zstd 支持**：`.zstd` / `.zst` 文件自动解压到 `~/Library/Caches/JSONLAnalyzer/`
   （按路径+大小+mtime 哈希缓存，内容不变不重复解压）。需要系统里有 `zstd` 命令
   （brew install zstd）。
-- **会话视图**：把 JSONL 还原成对话流——用户消息、LLM 回复、推理（折叠样式）、
+- **会话视图**：把 JSONL 还原成对话流——用户消息、系统消息、LLM 回复、推理（折叠样式）、
   工具调用（名称 + call_id + pretty 参数）与工具输出（长内容默认截断可展开）、
   Turn/压缩等关键事件作分隔线。兼容 DSH / Codex / Claude 三种格式；
   点击条目的"行 N"标签跳到原始行（进返回栈）。反过来，详情区停在"会话"页时，
   在记录列表里选中一行（或 ⌘G 跳转），会话视图会滚到这一行对应的条目并高亮其行号标签
   （没有对应条目的行，如 token_count 事件，取行号最近的条目）。
+- **会话气泡的 Markdown 渲染**：正文按 Markdown 显示（标题、列表、加粗、行内代码、代码块、
+  引用），表格画成真正的分列，单元格再长也不会散。哪些正文渲染，按类型和内容定：
+  - 助手回复、推理、系统消息：一律渲染。系统消息是 Codex 的 developer / system 角色消息
+    （系统提示词、注入的上下文），气泡上标「系统」，不算作用户说的；
+  - 用户输入、工具调用的参数：文档和代码、普通文字都有。开头不是代码、补丁或 JSON，且正文里
+    有标题、加粗小节或表格的，才当作文档。Codex 自动注入的 AGENTS.md、包在 `<skill>` 里的
+    SKILL.md 都属于这一类——开头的包裹标签不算正文，先去掉再判断；
+  - 工具输出：一律原样——多半是命令行日志、JSON，`# pass 59` 这样的汇总行也不是标题。
+  只有列表或行内加粗的不算文档；对话记录转储（`[166] assistant: …` 这样的记录行）也不算。
+  判定不准时右键气泡，可手动切换「按 Markdown 显示 / 显示原文」；右键也能复制 Markdown 原文。
+  长正文默认折叠：在 12 行的预算内从开头往后取，表格不会整张藏起来，点「展开」看全文。
 - **Codex 专项处理**（依据 codex-rs 源码勘察）：
   - Token：只统计 `token_usage_record.payload.usage`（单次请求），跳过
     `token_count` 事件与 `compacted` 内嵌快照；混合总量按官方公式
@@ -70,11 +81,12 @@ macOS 原生（Swift / SwiftUI）的 JSONL 文件分析工具，面向 DSH / Cod
 ```bash
 cd JSONLAnalyzer
 swift build            # 开发调试
-swift test             # 单元测试（52 个）
+swift test             # 单元测试（62 个）
 ./make-app.sh          # 生成 release 并打包 "JSONL Analyzer.app"（ad-hoc 签名，可双击）
 ```
 
 双击 `JSONL Analyzer.app`，或在 Finder 里把 `.jsonl` / `.zstd` 拖到 App 图标上打开。
+
 
 ## 命令行模式（顺手可用，非主打）
 
@@ -95,6 +107,8 @@ swift test             # 单元测试（52 个）
   100 MB 级文件内存占用为行索引级别。
 - 会话视图逐行回读、建完条目就丢掉解析树，内存只与条目正文总量有关，不随文件大小增长。
 - 文本视图的抽取结果与 Markdown 渲染结果按行缓存，搜索时不再重复读取和渲染。
+- 会话气泡的 Markdown 渲染结果按正文缓存（最多 120 条 / 2 MB 原文）；超过 2000 字节的正文
+  放到后台渲染，算完再通知气泡替换占位的原文，滚动时不卡在渲染上。
 
 ## 目录结构
 
@@ -111,6 +125,7 @@ Sources/JSONLAnalyzer/
     MarkdownRenderer.swift  轻量块级 Markdown 渲染器
     JsonHighlighter.swift   JSON 语法着色 + NSTextView 封装
   Views/                    三栏窗口、侧栏、记录列表、详情（会话/记录/关联/文本/概览/字段/时间线）
+    ChatBodyCache.swift     会话正文的 Markdown 渲染缓存（后台渲染、折叠、分列表格）
 Tests/JSONLAnalyzerTests/   解析、扫描、读取器、会话还原、缓存与加载状态机的单元测试
 make-app.sh                 打包 .app
 ```

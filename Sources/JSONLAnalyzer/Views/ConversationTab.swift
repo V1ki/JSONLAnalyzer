@@ -6,6 +6,8 @@ struct ConversationTab: View {
     @EnvironmentObject private var records: RecordStore
     @State private var entries: [ChatEntry] = []
     @State private var building = false
+    /// 正文的 Markdown 渲染结果（按条目缓存，长正文在后台渲染）
+    @State private var bodies = ChatBodyCache()
     /// 会话视图还没建好时收到的定位请求：要滚到的那一行，建好后处理
     @State private var pendingLine: Int?
 
@@ -38,7 +40,7 @@ struct ConversationTab: View {
                                     LazyVStack(alignment: .leading, spacing: 10) {
                                         ForEach(entries) { e in
                                             let isCurrent = e.lineNo == model.selectedRow?.id
-                                            ChatEntryView(entry: e, isCurrent: isCurrent) { row in
+                                            ChatEntryView(entry: e, isCurrent: isCurrent, bodies: bodies) { row in
                                                 if let target = records.rows.first(where: { $0.id == row }) {
                                                     // 请求来自会话视图自己：只跳记录列表，不回头滚动会话
                                                     model.navigate(to: target, revealInConversation: false)
@@ -143,10 +145,12 @@ struct ConversationTab: View {
 
 // MARK: - 单条气泡
 
-private struct ChatEntryView: View {
+struct ChatEntryView: View {
     let entry: ChatEntry
     /// 这一条正是记录列表里选中的行：行号标签常亮，看得出会话视图滚到了哪一条
     var isCurrent = false
+    /// 正文缓存：长正文的渲染结果由它在后台算好后通知这里重新取
+    @ObservedObject var bodies: ChatBodyCache
     let onJump: (Int) -> Void
     @State private var expanded = false
     @State private var hovering = false
@@ -154,6 +158,7 @@ private struct ChatEntryView: View {
     private var roleTag: String {
         switch entry.kind {
         case .user: return "用户"
+        case .system: return "系统"
         case .assistant: return "助手"
         case .reasoning: return "推理"
         case .toolCall: return "调用"
@@ -165,6 +170,7 @@ private struct ChatEntryView: View {
     private var roleColor: Color {
         switch entry.kind {
         case .user: return .blue
+        case .system: return .pink
         case .assistant: return .green
         case .reasoning: return .orange
         case .toolCall: return .purple
@@ -187,6 +193,9 @@ private struct ChatEntryView: View {
                 Rectangle().fill(Color.secondary.opacity(0.3)).frame(height: 0.7).frame(maxWidth: .infinity)
             }
         } else {
+            // 一次 body 求值里只判断、只取一次
+            let renders = bodies.renders(entry)
+            let rendered = renders ? bodies.rendered(entry.body) : nil
             HStack(alignment: .top, spacing: 8) {
                 VStack(alignment: .trailing, spacing: 3) {
                     let lit = hovering || isCurrent
@@ -221,7 +230,7 @@ private struct ChatEntryView: View {
                         }
                     }
                     if !entry.body.isEmpty {
-                        bodyView
+                        bodyView(renders: renders, rendered: rendered)
                     }
                 }
                 .padding(10)
@@ -240,33 +249,51 @@ private struct ChatEntryView: View {
             .onTapGesture { onJump(entry.lineNo) }
             .onHover { hovering = $0 }
             .help("点击跳到记录列表第 \(entry.lineNo) 行")
+            .contextMenu {
+                // 渲染后的气泡里选不到标记本身，所以原文只能从这里复制
+                Button {
+                    copy(entry.body)
+                } label: {
+                    Label(renders ? "复制 Markdown 原文" : "复制", systemImage: "doc.on.doc")
+                }
+                // 自动判断不准时（工具调用的参数里，文档和代码都有）手动切换
+                Button {
+                    bodies.setRenders(!renders, for: entry.body)
+                    expanded = false
+                } label: {
+                    Label(renders ? "显示原文" : "按 Markdown 显示", systemImage: renders ? "doc.plaintext" : "doc.richtext")
+                }
+            }
         }
     }
 
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
     @ViewBuilder
-    private var bodyView: some View {
-        let mono = entry.kind == .toolCall || entry.kind == .toolOutput
-        let long = entry.body.count > 600 || entry.body.components(separatedBy: "\n").count > 12
+    private func bodyView(renders: Bool, rendered: ChatBodyRendered?) -> some View {
+        let foldable = isLong(renders: renders, rendered: rendered)
         Group {
-            if mono {
-                Text(expanded ? entry.body : truncatedBody)
-                    .font(.system(size: 10.5, design: .monospaced))
-                    .textSelection(.enabled)
-            } else if entry.kind == .reasoning {
-                Text(expanded ? entry.body : truncatedBody)
-                    .font(.system(size: 11.5))
-                    .italic()
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+            if renders {
+                if let rendered {
+                    MarkdownBody(rendered: rendered, expanded: expanded)
+                } else {
+                    // 长正文还在后台渲染：先拿原文占位，免得气泡空着
+                    Text(truncated(entry.body))
+                        .font(.system(size: 12.5))
+                        .textSelection(.enabled)
+                }
             } else {
-                Text(entry.body)
-                    .font(.system(size: 12.5))
-                    .textSelection(.enabled)
+                plainBody
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // 给「展开 / 收起」留出位置，不压住最后一行
+        .padding(.bottom, foldable ? 14 : 0)
         .overlay(alignment: .bottomTrailing) {
-            if long {
+            if foldable {
                 Button(expanded ? "收起" : "展开") {
                     expanded.toggle()
                 }
@@ -279,17 +306,53 @@ private struct ChatEntryView: View {
         }
     }
 
-    private var truncatedBody: String {
-        let lines = entry.body.components(separatedBy: "\n")
+    /// 正文比折叠后显示的多
+    private func isLong(renders: Bool, rendered: ChatBodyRendered?) -> Bool {
+        if renders { return rendered?.isLong ?? isPlainLong(entry.body) }
+        return isPlainLong(entry.body)
+    }
+
+    /// 没渲染时的长文判断（沿用原来的规则：超过 600 字节或 12 行）
+    private func isPlainLong(_ text: String) -> Bool {
+        text.utf8.count > 600 || text.components(separatedBy: "\n").count > 12
+    }
+
+    /// 没渲染时的折叠：前 12 行，或不足 12 行时的前 600 字
+    private func truncated(_ text: String) -> String {
+        let lines = text.components(separatedBy: "\n")
         if lines.count > 12 {
             return lines.prefix(12).joined(separator: "\n") + "\n…"
         }
-        return String(entry.body.prefix(600)) + "…"
+        return String(text.prefix(600)) + "…"
+    }
+
+    /// 现状的画法：工具调用/输出等宽，推理斜体，用户消息普通字体
+    @ViewBuilder
+    private var plainBody: some View {
+        let mono = entry.kind == .toolCall || entry.kind == .toolOutput
+        Group {
+            if mono {
+                Text(expanded ? entry.body : truncated(entry.body))
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .textSelection(.enabled)
+            } else if entry.kind == .reasoning {
+                Text(expanded ? entry.body : truncated(entry.body))
+                    .font(.system(size: 11.5))
+                    .italic()
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            } else {
+                Text(entry.body)
+                    .font(.system(size: 12.5))
+                    .textSelection(.enabled)
+            }
+        }
     }
 
     private var bubbleBackground: Color {
         switch entry.kind {
         case .user: return Color.blue.opacity(0.08)
+        case .system: return Color.pink.opacity(0.05)
         case .assistant: return Color(nsColor: .controlBackgroundColor)
         case .reasoning: return Color.orange.opacity(0.05)
         case .toolCall: return Color.purple.opacity(0.06)

@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import JSONLAnalyzer
 
 private func parseLine(_ s: String, number: Int = 1, offset: UInt64 = 0) -> RecordRow {
@@ -762,6 +763,324 @@ final class AnalysisTests: XCTestCase {
         cache.setCandidates([TextCandidate(path: "x", text: short)], for: rows[0].id)
         cache.sync(token: 1)
         XCTAssertEqual(cache.candidates(for: rows[0], file: file)?.count, 1)
+    }
+
+    // MARK: 会话气泡的 Markdown 显示
+
+    func testSplitTables() {
+        let body = [
+            "看完了。这一批去污结果：",
+            "",
+            "| Case | 采集中 MB |",
+            "|---|---:|:---:|",
+            "| `mmc_cycle` | 2758 |",
+            "| `mfc_portal` | 4500 |",
+            "",
+            "## 二、延迟分布",
+            "",
+            "结尾。",
+        ].joined(separator: "\n")
+        let segs = ConversationBuilder.splitTables(body)
+        XCTAssertEqual(segs.count, 3)
+        XCTAssertEqual(segs[1], .table(rows: [["Case", "采集中 MB"], ["`mmc_cycle`", "2758"], ["`mfc_portal`", "4500"]]))
+        // 表格前后的文字原样保留：把表格换成一个占位行后拼回去应与原文相同
+        let rebuilt = segs.map { seg -> String in
+            switch seg {
+            case .markdown(let t): return t
+            case .table: return "<TABLE>"
+            }
+        }.joined(separator: "\n")
+        XCTAssertEqual(rebuilt, body.replacingOccurrences(of: "| Case | 采集中 MB |\n|---|---:|:---:|\n| `mmc_cycle` | 2758 |\n| `mfc_portal` | 4500 |", with: "<TABLE>"))
+    }
+
+    func testSplitTablesIsStrict() {
+        func tables(_ s: String) -> Int { ConversationBuilder.splitTables(s).filter { if case .table = $0 { return true }; return false }.count }
+        // 没有表格
+        XCTAssertEqual(tables("普通文本\n\n**加粗** `code`"), 0)
+        XCTAssertEqual(ConversationBuilder.splitTables("普通文本"), [.markdown("普通文本")])
+        // 有竖线但没有分隔行：不是表格
+        XCTAssertEqual(tables("| a | b |\n| 1 | 2 |"), 0)
+        // 分隔行里有别的字符：不是表格
+        XCTAssertEqual(tables("| a | b |\n| x- | --- |\n| 1 | 2 |"), 0)
+        // 竖线出现在行中间而不是开头：不是表格
+        XCTAssertEqual(tables("a | b\n--- | ---\n1 | 2"), 0)
+        // 只认以竖线开头的行：不带首尾竖线的写法不支持，免得正文里的 "说明 | 附注" 被当成表格
+        XCTAssertEqual(tables("a | b\n--- | ---\n1 | 2"), 0)
+        // 分隔行的对齐冒号；单元格里的转义竖线保留反斜杠（交给行内解析）
+        XCTAssertEqual(tables("| a | b |\n| :--- | ---: |\n| 1 | 2 |"), 1)
+        let segs = ConversationBuilder.splitTables("| a\\|b | c |\n|---|---|\n| 1 | 2 |")
+        XCTAssertEqual(segs, [.table(rows: [["a\\|b", "c"], ["1", "2"]])])
+        // 两个表格相邻、表格在开头 / 结尾、数据行缺失（只有表头）
+        XCTAssertEqual(tables("| a |\n|---|\n\n| b |\n|---|\n| 1 |"), 2)
+        XCTAssertEqual(ConversationBuilder.splitTables("| a |\n|---|"), [.table(rows: [["a"]])])
+        // 表格后紧跟普通行：普通行归到下一段文字，不并入表格
+        let mixed = ConversationBuilder.splitTables("| a |\n|---|\n| 1 |\n普通行")
+        XCTAssertEqual(mixed.count, 2)
+        XCTAssertEqual(mixed[1], .markdown("普通行"))
+    }
+
+    func testRendersMarkdownByKind() {
+        typealias B = ConversationBuilder
+        XCTAssertTrue(B.rendersMarkdown(kind: .assistant, body: "随便什么"))
+        XCTAssertTrue(B.rendersMarkdown(kind: .reasoning, body: "随便什么"))
+        XCTAssertTrue(B.rendersMarkdown(kind: .system, body: "随便什么"), "系统消息一律渲染")
+        XCTAssertFalse(B.rendersMarkdown(kind: .user, body: "帮我把 src/**/*_v2.tmp 删掉"), "普通输入：原样显示")
+        XCTAssertTrue(B.rendersMarkdown(kind: .user, body: "# 需求文档\n\n## 背景\n说明"), "用户贴进来的文档：渲染")
+        XCTAssertFalse(B.rendersMarkdown(kind: .toolOutput, body: "# 看起来像标题也不渲染"), "工具输出里的 # 可能是测试汇总行")
+        // 工具调用：开头不是代码，正文里有标题 / 加粗小节 / 表格，才算文档
+        XCTAssertTrue(B.rendersMarkdown(kind: .toolCall, body: "# 报告\n\n正文"))
+        XCTAssertTrue(B.rendersMarkdown(kind: .toolCall, body: "看完了。\n\n## 一、结果"))
+        XCTAssertTrue(B.rendersMarkdown(kind: .toolCall, body: "### 三级也行"))
+        XCTAssertTrue(B.rendersMarkdown(kind: .toolCall, body: "看完了。\n\n**一、结果**\n\n正文"))
+        XCTAssertTrue(B.rendersMarkdown(kind: .toolCall, body: "结果：\n\n| Case | MB |\n|---|---:|\n| a | 1 |"))
+        XCTAssertFalse(B.rendersMarkdown(kind: .toolCall, body: "看完了。这一批去污结果：\n| Case | MB |"),
+                       "有竖线没有分隔行：不是表格，也没有别的结构")
+    }
+
+    /// Codex 会话开头的系统提示词是 developer 角色，自动注入的 AGENTS.md 指令是 user 角色。
+    /// 以前前者被当成「用户」、两者都不渲染，会话视图一打开就是整页的 `# Personality`、`## 表达`。
+    func testSystemAndInjectedDocumentsRender() {
+        typealias B = ConversationBuilder
+        let pairs: [(row: RecordRow, dict: [String: Any])] = [
+            (row(4, "response_item", "message"),
+             dict(#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"You are Codex, an agent.\n\n# Personality\nAs Codex, you are a curious collaborator.\n\n## Writing style\nYour style is warm and candid."}]}}"#)),
+            (row(8, "response_item", "message"),
+             dict(##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /Users/x/proj\n\n<INSTRUCTIONS>\n# 沟通与协作偏好\n\n## 表达\n- 先说结论\n</INSTRUCTIONS>"}]}}"##)),
+            (row(9, "response_item", "message"),
+             dict(#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"帮我把 src/a_b.py 里的 *all* 改名，再跑 npm test"}]}}"#)),
+            // 角色缺失时仍按用户处理
+            (row(10, "response_item", "message"),
+             dict(#"{"type":"response_item","payload":{"type":"message","content":[{"type":"input_text","text":"继续"}]}}"#)),
+        ]
+        let entries = ConversationBuilder.build(pairs)
+        XCTAssertEqual(entries.map(\.kind), [.system, .user, .user, .user])
+        XCTAssertTrue(B.rendersMarkdown(kind: entries[0].kind, body: entries[0].body), "系统消息一律渲染")
+        XCTAssertTrue(B.rendersMarkdown(kind: entries[1].kind, body: entries[1].body),
+                      "注入的 AGENTS.md 是一篇文档，要渲染；标题后面的 <INSTRUCTIONS> 不是代码")
+        XCTAssertFalse(B.rendersMarkdown(kind: entries[2].kind, body: entries[2].body), "普通输入：原样显示")
+        XCTAssertFalse(B.rendersMarkdown(kind: entries[3].kind, body: entries[3].body))
+    }
+
+    /// 自动注入的用户消息常把文档包在标签里（真实数据里 `<skill>` 有 367 条，每条是一整篇 SKILL.md）。
+    /// 标签不是正文，判断前先去掉；标签里不是文档的照样原样显示。
+    func testUserMessagesWrappedInTags() {
+        typealias B = ConversationBuilder
+        func user(_ s: String) -> Bool { B.rendersMarkdown(kind: .user, body: s) }
+        let skill = """
+        <skill>
+        <name>playwright-interactive</name>
+        <path>/Users/x/.codex/skills/playwright-interactive/SKILL.md</path>
+        ---
+        name: "playwright-interactive"
+        ---
+
+        # Playwright Interactive Skill
+
+        Use a persistent `js_repl` Playwright session.
+
+        ## Preconditions
+
+        - `js_repl` must be enabled for this skill.
+        """
+        XCTAssertTrue(user(skill), "<skill> 里是一整篇 SKILL.md：文档；去掉标签后开头是：\(ConversationBuilder.droppingLeadingTags(skill).prefix(40).debugDescription)")
+        XCTAssertTrue(user("<in-app-browser-context source=\"ambient-ui-state\">\nThis block is ambient UI state.\n## In app browser\n- The user has the in-app browser open.\n</in-app-browser-context>"),
+                      "带属性的块标签同样先去掉")
+        XCTAssertFalse(B.rendersMarkdown(kind: .toolCall, body: skill), "工具调用的参数不走这条路：规则不变")
+        // 标签里不是文档的，仍然原样显示
+        XCTAssertFalse(user("<recommended_plugins>\nHere is a list of plugins that are available but not installed.\n\n- Dropbox (box@x)\n- Box (box@y)\n</recommended_plugins>"),
+                       "只有列表：不算文档")
+        XCTAssertFalse(user("<environment_context>\n  <cwd>/tmp/x</cwd>\n  <shell>zsh</shell>\n</environment_context>"), "环境上下文：键值")
+        XCTAssertFalse(user("<external_codex_apps_open_page>{\"page_id\":null}</external_codex_apps_open_page>"), "标签里是 JSON")
+        XCTAssertFalse(user("<user_shell_command>\n<command>git diff</command>\n<result>\nExit code: 0\nOutput:\ndiff --git a/UI-UX.md b/UI-UX.md\n</result>\n</user_shell_command>"),
+                       "命令和它的输出：不是文档")
+        XCTAssertFalse(user("<multi_agent_role>You are `/root`, the primary agent.</multi_agent_role>"), "一段说明，没有结构")
+    }
+
+    /// 对话记录转储里的标题、表格是被引用的别人说过的话，不是这篇正文自己的结构
+    /// （真实数据里审批评估用的历史转储有 182 条因此被误判过）。
+    func testTranscriptDumpsAreNotDocuments() {
+        func doc(_ s: String) -> Bool { ConversationBuilder.looksLikeDocument(s) }
+        XCTAssertFalse(doc("""
+        The following is the Codex agent history whose request action you are assessing.
+
+        >>> ROOT CONVERSATION START
+
+        user: 其次,为什么我在 GitHub 里面@ zero 这个时候列表中没有 zero 可选呢?
+
+        assistant: 因为工作区里还没有这个成员。
+
+        | 问题 | 当前行为 |
+        |---|---|
+        | **工程 Worker 被过度隔离** | 统一关闭网络 |
+        """))
+        XCTAssertFalse(doc("""
+        [20] assistant: 钥匙串提示已处理，我继续验收最终界面。
+
+        [21] tool js call: {"code":"await cua.rewriteDocumentation()"}
+
+        [22] tool js result: Wall time: 0.0046 seconds
+        Output:
+        ## Computer Use
+
+        Control native apps and browsers.
+        """))
+        // 只有一行记录样的行：仍然是文档
+        XCTAssertTrue(doc("# 对话示例\n\nuser: 帮我把 src/**/*_v2.tmp 删掉\n\n## 步骤\n说明"))
+        // 表格在首行
+        XCTAssertTrue(doc("| 参数 | 含义 |\n|---|---|\n| payload | 负载 |"))
+    }
+
+    /// 工具调用的参数里文档和代码都有，而且代码里常带着 Markdown（写文件、改文档）。
+    /// 这里的反例都取自真实会话里出现过的形态。
+    func testToolCallDocumentRuleSeparatesCodeFromDocs() {
+        func doc(_ s: String) -> Bool { ConversationBuilder.looksLikeDocument(s) }
+        // 报告：说明文字 + 加粗小节 + 表格
+        XCTAssertTrue(doc("""
+        看完了。这一批 AFU TLC 去污目标中，FailedLog 丢失数目总部，不能将项目录取诊断为"日志损坏"。
+
+        日志已记录：
+
+        （AFU TLC PV: COM13-CO42 (c-\\172.18.2.202\\GuestData)SKgenteBuild\\XU4\\3-CO42-1785216165）
+
+        **一、可直接收集的吞吐结果**
+
+        | Case | 采集中/总数据 | 当前情况 |
+        |---|---|---|
+        | `mmc_cycle` | 2758 / 空盘连续写 | 第 1 轮 `31.257~51.261 MB/s` |
+
+        - 第一项说明
+        """))
+        // 开头是普通文字、正文里没有结构：原样显示（列表本身不算）
+        XCTAssertFalse(doc("看完了。没有标记的说明。"))
+        XCTAssertFalse(doc("结论：\n\n- 第一项说明\n- 第二项说明"))
+        XCTAssertFalse(doc("加粗在句子开头 **不算** 小节标题。\n\n正文"))
+        // 补丁里改动的标题行是补丁的内容
+        XCTAssertFalse(doc("*** Begin Patch\n*** Update File: README.md\n@@\n-# 标题\n+## 另一个标题\n*** End Patch"))
+        // 代码里写入的 Markdown：JS 包着 shell，shell 里是 heredoc，heredoc 里才是文档
+        XCTAssertFalse(doc("text(await tools.exec_command({cmd:`cat > README.md <<'EOF'\n# Coding Plan\n\n| 路径 | 用途 |\n|---|---|\n| GET /healthz | 健康检查 |\nEOF`})"))
+        XCTAssertFalse(doc("await eval(load(\"run\"))(`cat > README.md <<'EOF'\n# Coding Plan\n## 入口\n| 路径 |\n|---|"))
+        XCTAssertFalse(doc("const draft = `## 中文\n\n已复核当前 main。\n\n1. **明确徽标显示哪个账号。**`"))
+        // 其它形态的代码与数据
+        XCTAssertFalse(doc("{\n  \"cmd\": \"ls -la\",\n  \"cwd\": \"/tmp\"\n}"))
+        XCTAssertFalse(doc("[{\"a\": 1}, {\"b\": 2}]"))
+        XCTAssertFalse(doc("#!/bin/bash\necho hi"))
+        XCTAssertFalse(doc("// 说明\nconst x = 1\n\n## 不是标题"))
+        XCTAssertFalse(doc("<result>\n<status>ok</status>\n\n## 说明\n</result>"))
+        XCTAssertFalse(doc("qaResults.traceTab = await page.locator('x').innerText()\n\n## 中文"))
+        XCTAssertFalse(doc("browser.evaluate(() => {\n  return document.title\n})"))
+        // 以单个 # 开头的：可能是标题，也可能是脚本的第一行注释——注释后面跟着代码的不算
+        XCTAssertTrue(doc("# 清理脚本\n\n先备份数据库，再运行下面的命令。"))
+        XCTAssertFalse(doc("# 清理脚本\nrm -rf /tmp/cache\n\n# 完成"))
+        XCTAssertFalse(doc("# 备忘\n# 第二行注释\npip install -r requirements.txt"))
+        XCTAssertFalse(doc("#tag 不是标题（# 后没有空格）"))
+        XCTAssertFalse(doc("####### 七个 # 不是标题"))
+        // 标题后面跟着 <INSTRUCTIONS>、<system-reminder> 这样的包裹标签：是文档里的内容，不是代码
+        XCTAssertTrue(doc("# AGENTS.md instructions for /Users/x/proj\n\n<INSTRUCTIONS>\n# 沟通与协作偏好\n\n## 表达\n- 先说结论\n</INSTRUCTIONS>"))
+        XCTAssertTrue(doc("# 项目约定\n\n<system-reminder>\n先说结论，再给步骤。\n</system-reminder>"))
+        // 文档里的普通行不会被当成代码
+        XCTAssertTrue(doc("README.md 已更新。\n\n## 变更"))
+        XCTAssertTrue(doc("`npm install` 报错：\n\n## 原因"))
+        XCTAssertTrue(doc("[说明](https://example.com) 见链接。\n\n## 标题"))
+        XCTAssertTrue(doc("With that done, the table below summarises it.\n\n| a | b |\n|---|---|\n| 1 | 2 |"))
+    }
+
+    /// 折叠：从正文开头起按行数预算取内容，说明文字之后接着露出表头和前几行，不会把表格整张藏起来
+    func testMarkdownFoldKeepsTableHeadWithinBudget() throws {
+        func table(_ rows: Int) -> String {
+            (0..<rows).map { "| case\($0) | \($0) MB |" }.joined(separator: "\n")
+        }
+        let body = "说明第一行\n说明第二行\n\n**小节**\n\n| Case | MB |\n|---|---|\n" + table(30) + "\n\n后面的文字"
+        let r = ChatBodyRendered(body: body)
+        XCTAssertTrue(r.isLong)
+        XCTAssertNil(r.whole)
+        // 第一块是表格之前的说明（4 行），第二块是表格的前面几行；预算用完后，表格之后的文字不显示
+        XCTAssertEqual(r.folded.count, 2)
+        guard case .text(let lead) = r.folded[0], case .table(let shown) = r.folded[1] else {
+            return XCTFail("折叠内容应当是 说明文字 + 表格：\(r.folded)")
+        }
+        XCTAssertFalse(lead.string.contains("…"), "说明文字完整保留：\(lead.string)")
+        XCTAssertTrue(lead.string.contains("小节"))
+        XCTAssertEqual(shown.first, ["Case", "MB"])
+        XCTAssertEqual(shown.count, ChatBodyRendered.clippedLines - 4, "剩余预算都给表格的行")
+        // 全部放得下的正文不算长的：没有「展开」
+        let short = ChatBodyRendered(body: "说明\n\n| a | b |\n|---|---|\n| 1 | 2 |")
+        XCTAssertTrue(short.isLong == false)
+        XCTAssertEqual(short.folded.count, 2)
+        // 表格在开头：折叠时只露出前面几行
+        let first = ChatBodyRendered(body: "| a | b |\n|---|---|\n" + table(20))
+        XCTAssertEqual(first.folded.count, 1)
+        guard case .table(let rows) = first.folded[0] else { return XCTFail("折叠内容应当是表格：\(first.folded)") }
+        XCTAssertEqual(rows.count, ChatBodyRendered.clippedLines)
+        // 没有表格：折叠就是截到预算的整段富文本
+        let plain = ChatBodyRendered(body: (1...20).map { "第 \($0) 行" }.joined(separator: "\n"))
+        XCTAssertNotNil(plain.whole)
+        XCTAssertTrue(plain.isLong)
+        guard case .text(let cut) = plain.folded[0] else { return XCTFail("折叠内容应当是文字：\(plain.folded)") }
+        XCTAssertTrue(cut.string.hasSuffix("…\n"))
+        XCTAssertFalse(cut.string.contains("第 12 行"), "截到预算处：\(cut.string.suffix(40).debugDescription)")
+        XCTAssertFalse(ChatBodyRendered(body: "短正文").isLong)
+    }
+
+    @MainActor
+    func testChatBodyCacheKeysByBodyAndHonoursOverride() async throws {
+        let cache = ChatBodyCache()
+        func entry(_ id: Int, _ kind: ChatKind, _ body: String) -> ChatEntry {
+            ChatEntry(id: id, kind: kind, lineNo: id, time: nil, title: nil, body: body, meta: nil)
+        }
+        // 条目 id 每次重建都会重复使用：同一个 id 换了正文，不能显示上一份的渲染结果
+        let a = entry(1, .assistant, "第一份 **正文**")
+        XCTAssertNotNil(cache.rendered(a.body))
+        let b = entry(1, .assistant, "第二份正文")
+        let second = try XCTUnwrap(cache.rendered(b.body)?.whole?.string)
+        XCTAssertTrue(second.contains("第二份"))
+        XCTAssertFalse(second.contains("第一份"))
+
+        // 手动指定优先于内容判断
+        let user = entry(2, .user, "帮我把 src/a_b.py 里的 *all* 改名")
+        XCTAssertFalse(cache.renders(user))
+        cache.setRenders(true, for: user.body)
+        XCTAssertTrue(cache.renders(user))
+        XCTAssertNotNil(cache.rendered(user.body))
+        cache.setRenders(false, for: user.body)
+        XCTAssertFalse(cache.renders(user))
+        let report = entry(3, .toolCall, "看完了。\n\n## 一、结果")
+        XCTAssertTrue(cache.renders(report))
+        cache.setRenders(false, for: report.body)
+        XCTAssertFalse(cache.renders(report))
+
+        // 长正文：先返回 nil，后台算好后才有；算完会通知观察者
+        var notifications = 0
+        let observer = cache.objectWillChange.sink { _ in notifications += 1 }
+        defer { observer.cancel() }
+        let long = entry(4, .assistant, String(repeating: "很长的一行正文。\n", count: 300))
+        XCTAssertGreaterThan(long.body.utf8.count, ChatBodyCache.asyncThreshold)
+        XCTAssertNil(cache.rendered(long.body))
+        XCTAssertNil(cache.rendered(long.body))
+        XCTAssertEqual(notifications, 0, "还在算的时候没有可通知的变化")
+        for _ in 0..<500 where cache.rendered(long.body) == nil {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let rendered = try XCTUnwrap(cache.rendered(long.body))
+        XCTAssertTrue(rendered.isLong)
+        XCTAssertGreaterThanOrEqual(notifications, 1)
+    }
+
+    func testClippingAttributedTextAtLineBoundary() {
+        let attr = MarkdownRenderer.render("# 标题\n\n第一段 **加粗** 文字\n\n第二段\n\n第三段")
+        // 行数够：原样返回
+        XCTAssertTrue(ConversationBuilder.clipping(attr, toLines: 20) === attr)
+        // 截到 2 行：在第 2 个换行符之后断开，后面是省略号；标题的字体属性完整保留
+        let cut = ConversationBuilder.clipping(attr, toLines: 2)
+        let text = cut.string
+        XCTAssertEqual(text, "# 标题\n…\n".replacingOccurrences(of: "# ", with: ""), "实际：\(text.debugDescription)")
+        let font = cut.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        XCTAssertNotNil(font)
+        XCTAssertGreaterThan(font?.pointSize ?? 0, 16, "标题字号应保留")
+        // 省略号是次要颜色
+        let dots = (cut.string as NSString).range(of: "…")
+        XCTAssertNotEqual(dots.location, NSNotFound)
+        let color = cut.attribute(.foregroundColor, at: dots.location, effectiveRange: nil) as? NSColor
+        XCTAssertEqual(color, NSColor.secondaryLabelColor)
     }
 
     // MARK: 会话视图定位
