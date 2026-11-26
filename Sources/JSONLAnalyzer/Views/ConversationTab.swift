@@ -6,6 +6,8 @@ struct ConversationTab: View {
     @EnvironmentObject private var records: RecordStore
     @State private var entries: [ChatEntry] = []
     @State private var building = false
+    /// 会话视图还没建好时收到的定位请求：要滚到的那一行，建好后处理
+    @State private var pendingLine: Int?
 
     var body: some View {
         Group {
@@ -31,18 +33,25 @@ struct ConversationTab: View {
                             ProgressView("还原对话中…")
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                         } else {
-                            ScrollView {
-                                LazyVStack(alignment: .leading, spacing: 10) {
-                                    ForEach(entries) { e in
-                                        ChatEntryView(entry: e) { row in
-                                            if let target = records.rows.first(where: { $0.id == row }) {
-                                                model.navigate(to: target)
+                            ScrollViewReader { proxy in
+                                ScrollView {
+                                    LazyVStack(alignment: .leading, spacing: 10) {
+                                        ForEach(entries) { e in
+                                            let isCurrent = e.lineNo == model.selectedRow?.id
+                                            ChatEntryView(entry: e, isCurrent: isCurrent) { row in
+                                                if let target = records.rows.first(where: { $0.id == row }) {
+                                                    // 请求来自会话视图自己：只跳记录列表，不回头滚动会话
+                                                    model.navigate(to: target, revealInConversation: false)
+                                                }
                                             }
+                                            .id(e.id)
                                         }
                                     }
+                                    .padding(14)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                                 }
-                                .padding(14)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .onAppear { scrollToPending(proxy) }
+                                .onChange(of: pendingLine) { _ in scrollToPending(proxy) }
                             }
                         }
                     }
@@ -52,6 +61,11 @@ struct ConversationTab: View {
             } else {
                 ProgressView("解析中…").frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+        }
+        // 记录列表里选中了另一行（或 ⌘G、关联跳转）：记下要定位的行，滚动视图在场时由它滚过去；
+        // 条目还在构建时先记着，建好后再滚
+        .onChange(of: model.conversationLocate) { req in
+            pendingLine = req?.line
         }
         .task(id: "\(fileID)-\(records.rows.count)") {
             guard case .done = records.state, !records.rows.isEmpty else {
@@ -101,6 +115,17 @@ struct ConversationTab: View {
         building = false
     }
 
+    /// 把待定位的那一行对应的条目滚到视图顶部（顶部对齐：条目再高，行号标签也在可见范围内）。
+    private func scrollToPending(_ proxy: ScrollViewProxy) {
+        guard let line = pendingLine else { return }
+        pendingLine = nil
+        guard let target = ConversationBuilder.nearestEntry(to: line, in: entries) else { return }
+        // 等这一轮布局应用完再滚
+        DispatchQueue.main.async {
+            proxy.scrollTo(target.id, anchor: .top)
+        }
+    }
+
     private func emptyState(_ title: String, _ hint: String) -> some View {
         VStack(spacing: 8) {
             Image(systemName: "bubble.left.and.bubble.right")
@@ -120,6 +145,8 @@ struct ConversationTab: View {
 
 private struct ChatEntryView: View {
     let entry: ChatEntry
+    /// 这一条正是记录列表里选中的行：行号标签常亮，看得出会话视图滚到了哪一条
+    var isCurrent = false
     let onJump: (Int) -> Void
     @State private var expanded = false
     @State private var hovering = false
@@ -162,12 +189,13 @@ private struct ChatEntryView: View {
         } else {
             HStack(alignment: .top, spacing: 8) {
                 VStack(alignment: .trailing, spacing: 3) {
+                    let lit = hovering || isCurrent
                     Text("行 \(entry.lineNo)")
                         .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(hovering ? Color.white : .secondary)
+                        .foregroundStyle(lit ? Color.white : .secondary)
                         .padding(.horizontal, 4).padding(.vertical, 2)
                         .background(RoundedRectangle(cornerRadius: 4)
-                            .fill(hovering ? Color.accentColor : Color.primary.opacity(0.06)))
+                            .fill(lit ? Color.accentColor : Color.primary.opacity(0.06)))
                     if let t = entry.time {
                         Text(Fmt.timeOfDay.string(from: t))
                             .font(.system(size: 8, design: .monospaced))

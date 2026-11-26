@@ -2,7 +2,6 @@ import SwiftUI
 
 struct DetailTabs: View {
     @EnvironmentObject private var model: AppModel
-    @State private var tab = "record"
 
     var body: some View {
         Group {
@@ -15,13 +14,14 @@ struct DetailTabs: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                TabView(selection: $tab) {
+                // 当前标签页放在 AppModel 里：选中记录行时要据此判断「会话」页是否正显示着
+                TabView(selection: $model.detailTab) {
                     ConversationTab()
                         .tabItem { Label("会话", systemImage: "bubble.left.and.bubble.right") }
-                        .tag("chat")
+                        .tag(AppModel.conversationTab)
                     RecordDetailView()
                         .tabItem { Label("记录", systemImage: "doc.plaintext") }
-                        .tag("record")
+                        .tag(AppModel.recordTab)
                     ReferencesTab()
                         .tabItem { Label("关联", systemImage: "link") }
                         .tag("refs")

@@ -207,7 +207,7 @@ struct RecordListView: View {
                             RecordRowLine(row: r,
                                           selected: r.id == model.selectedRow?.id)
                                 .id(r.id)
-                                .onTapGesture { model.selectedRow = r }
+                                .onTapGesture { model.select(r) }
                         }
                     }
                 }

@@ -20,7 +20,9 @@ macOS 原生（Swift / SwiftUI）的 JSONL 文件分析工具，面向 DSH / Cod
 - **会话视图**：把 JSONL 还原成对话流——用户消息、LLM 回复、推理（折叠样式）、
   工具调用（名称 + call_id + pretty 参数）与工具输出（长内容默认截断可展开）、
   Turn/压缩等关键事件作分隔线。兼容 DSH / Codex / Claude 三种格式；
-  点击条目的"行 N"标签跳到原始行（进返回栈）。
+  点击条目的"行 N"标签跳到原始行（进返回栈）。反过来，详情区停在"会话"页时，
+  在记录列表里选中一行（或 ⌘G 跳转），会话视图会滚到这一行对应的条目并高亮其行号标签
+  （没有对应条目的行，如 token_count 事件，取行号最近的条目）。
 - **Codex 专项处理**（依据 codex-rs 源码勘察）：
   - Token：只统计 `token_usage_record.payload.usage`（单次请求），跳过
     `token_count` 事件与 `compacted` 内嵌快照；混合总量按官方公式
@@ -68,7 +70,7 @@ macOS 原生（Swift / SwiftUI）的 JSONL 文件分析工具，面向 DSH / Cod
 ```bash
 cd JSONLAnalyzer
 swift build            # 开发调试
-swift test             # 单元测试（50 个）
+swift test             # 单元测试（52 个）
 ./make-app.sh          # 生成 release 并打包 "JSONL Analyzer.app"（ad-hoc 签名，可双击）
 ```
 

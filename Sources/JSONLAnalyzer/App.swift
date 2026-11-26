@@ -26,17 +26,38 @@ final class AppModel: ObservableObject {
     @Published var locateToken = 0
     /// 关联/跳转导航历史（返回用）
     @Published var navBackStack: [RecordRow] = []
+    /// 详情区当前显示的标签页（标识与 DetailTabs 里各页的 .tag 一致）
+    @Published var detailTab = AppModel.recordTab
+    /// 会话视图定位请求：让「会话」页滚到某一行的条目（token 用于重复定位同一行）
+    @Published var conversationLocate: JumpRequest?
+
+    static let conversationTab = "chat"
+    static let recordTab = "record"
 
     var jumpTokenBase: Int { jumpRequest?.token ?? 0 }
 
+    /// 在记录列表里选中一行。详情区停在「会话」页时，会话视图跟着滚到这一行对应的条目。
+    func select(_ row: RecordRow) {
+        selectedRow = row
+        locateConversation(at: row.id)
+    }
+
+    /// 让「会话」页滚到某一行的条目；详情区不在「会话」页时什么也不做。
+    private func locateConversation(at line: Int) {
+        guard detailTab == AppModel.conversationTab else { return }
+        conversationLocate = JumpRequest(line: line, token: (conversationLocate?.token ?? 0) + 1)
+    }
+
     /// 关联导航：选中目标行并压入返回栈。
-    func navigate(to row: RecordRow) {
+    /// revealInConversation：是否同时让「会话」页滚到这一行。请求来自会话视图自己的行号标签时传 false，
+    /// 否则会话视图会把刚刚点击的那一条重新滚一遍。
+    func navigate(to row: RecordRow, revealInConversation: Bool = true) {
         if let cur = selectedRow, cur.id != row.id {
             navBackStack.append(cur)
             if navBackStack.count > 200 { navBackStack.removeFirst() }
         }
         jumpText = "\(row.id)"
-        _ = performJump()
+        _ = performJump(revealInConversation: revealInConversation)
     }
 
     /// 返回上一次导航前的记录。
@@ -63,7 +84,7 @@ final class AppModel: ObservableObject {
     }
 
     @discardableResult
-    func performJump() -> Bool {
+    func performJump(revealInConversation: Bool = true) -> Bool {
         let n = Int(jumpText.trimmingCharacters(in: .whitespaces)) ?? -1
         guard n >= 1 else {
             openError = "请输入有效的行号"
@@ -81,6 +102,7 @@ final class AppModel: ObservableObject {
         records.resetFilterForJump()
         selectedRow = row
         jumpRequest = JumpRequest(line: n, token: jumpTokenBase + 1)
+        if revealInConversation { locateConversation(at: n) }
         return true
     }
 

@@ -185,6 +185,22 @@ enum ConversationBuilder {
         return out
     }
 
+    /// 行号最接近 line 的条目（条目按行号递增）。优先行号相同的首个条目；
+    /// 没有对应条目的行（如 token_count 事件）取行号最近的，距离相同取靠前的。
+    static func nearestEntry(to line: Int, in entries: [ChatEntry]) -> ChatEntry? {
+        guard !entries.isEmpty else { return nil }
+        // 二分找第一个 lineNo >= line 的位置
+        var lo = 0, hi = entries.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if entries[mid].lineNo < line { lo = mid + 1 } else { hi = mid }
+        }
+        if lo == 0 { return entries[0] }
+        if lo == entries.count { return entries[entries.count - 1] }
+        let before = entries[lo - 1], after = entries[lo]
+        return (line - before.lineNo) <= (after.lineNo - line) ? before : after
+    }
+
     // MARK: - 字段提取辅助
 
     /// DSH content 数组项：text / reasoning / tool-call / tool-result（嵌套 content）

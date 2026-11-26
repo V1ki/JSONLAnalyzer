@@ -764,6 +764,70 @@ final class AnalysisTests: XCTestCase {
         XCTAssertEqual(cache.candidates(for: rows[0], file: file)?.count, 1)
     }
 
+    // MARK: 会话视图定位
+
+    private func entry(_ line: Int, _ id: Int) -> ChatEntry {
+        ChatEntry(id: id, kind: .user, lineNo: line, time: nil, title: nil, body: "", meta: nil)
+    }
+
+    func testNearestEntry() {
+        let entries = [entry(3, 0), entry(7, 1), entry(7, 2), entry(20, 3)]
+        XCTAssertNil(ConversationBuilder.nearestEntry(to: 5, in: []))
+        // 行号相同：取该行的第一条
+        XCTAssertEqual(ConversationBuilder.nearestEntry(to: 7, in: entries)?.id, 1)
+        // 没有对应条目的行：取行号最近的；距离相同取靠前的
+        XCTAssertEqual(ConversationBuilder.nearestEntry(to: 5, in: entries)?.id, 0)
+        XCTAssertEqual(ConversationBuilder.nearestEntry(to: 6, in: entries)?.id, 1)
+        XCTAssertEqual(ConversationBuilder.nearestEntry(to: 13, in: entries)?.id, 2)
+        XCTAssertEqual(ConversationBuilder.nearestEntry(to: 14, in: entries)?.id, 3)
+        // 在第一条之前 / 最后一条之后
+        XCTAssertEqual(ConversationBuilder.nearestEntry(to: 1, in: entries)?.id, 0)
+        XCTAssertEqual(ConversationBuilder.nearestEntry(to: 99, in: entries)?.id, 3)
+    }
+
+    @MainActor
+    func testSelectionLocatesConversationOnlyOnConversationTab() async throws {
+        let file = try JsonlFile.prepare(writeTemp((1...30).map {
+            #"{"type":"t\#($0)","seq":\#($0)}"#
+        }))
+        defer { try? FileManager.default.removeItem(at: file.url) }
+        let model = AppModel()
+        model.selectedFileID = file.url.path
+        model.records.load(file)
+        await waitUntilLoaded(model.records)
+        let row = try XCTUnwrap(model.records.rows.first { $0.id == 20 })
+
+        // 详情区默认是「记录」页：选中一行只改选中状态，不定位会话
+        XCTAssertEqual(model.detailTab, AppModel.recordTab)
+        model.select(row)
+        XCTAssertEqual(model.selectedRow?.id, 20)
+        XCTAssertNil(model.conversationLocate)
+
+        // 在「会话」页：选中即请求会话视图滚到这一行；重复选中同一行也会再请求
+        model.detailTab = AppModel.conversationTab
+        model.select(row)
+        XCTAssertEqual(model.conversationLocate?.line, 20)
+        let token = model.conversationLocate?.token
+        model.select(row)
+        XCTAssertEqual(model.conversationLocate?.line, 20)
+        XCTAssertEqual(model.conversationLocate?.token, (token ?? 0) + 1)
+
+        // ⌘G / 关联跳转同样定位；请求来自会话视图自己的行号标签时不定位
+        model.conversationLocate = nil
+        model.navigate(to: row, revealInConversation: false)
+        XCTAssertEqual(model.selectedRow?.id, 20)
+        XCTAssertEqual(model.jumpRequest?.line, 20)
+        XCTAssertNil(model.conversationLocate)
+        model.navigate(to: row)
+        XCTAssertEqual(model.conversationLocate?.line, 20)
+
+        // 跳转失败时不定位
+        model.conversationLocate = nil
+        model.jumpText = "999"
+        XCTAssertFalse(model.performJump())
+        XCTAssertNil(model.conversationLocate)
+    }
+
     // MARK: LineReader
 
     func testLineReaderOffsets() throws {
